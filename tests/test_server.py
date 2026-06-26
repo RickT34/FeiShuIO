@@ -97,7 +97,85 @@ def test_bind_send_and_recv_flow(tmp_path):
     assert recv.status_code == 200
     assert recv.json()["messages"][0]["text"] == "hi"
     assert recv.json()["messages"][0]["external_message_id"] == "om_2"
-    assert fake.reactions == [("om_2", "OK")]
+    assert fake.reactions == [("om_2", "Get")]
+
+
+def test_recv_unread_can_require_explicit_ack(tmp_path):
+    client, fake = make_client(tmp_path)
+    client.post(
+        "/feishu/events",
+        json={
+            "header": {"token": "verify"},
+            "event": {
+                "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_1"}},
+                "message": {
+                    "message_id": "om_bind",
+                    "chat_id": "oc_test",
+                    "message_type": "text",
+                    "content": '{"text":"/bind test"}',
+                },
+            },
+        },
+    )
+    client.post(
+        "/feishu/events",
+        json={
+            "header": {"token": "verify"},
+            "event": {
+                "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_2"}},
+                "message": {
+                    "message_id": "om_2",
+                    "chat_id": "oc_test",
+                    "message_type": "text",
+                    "content": '{"text":"leased"}',
+                },
+            },
+        },
+    )
+
+    leased = client.post(
+        "/recv_unread",
+        headers={"X-API-Key": "secret-key"},
+        json={"id": "test", "ack": False},
+    )
+    empty_while_leased = client.post(
+        "/recv_unread",
+        headers={"X-API-Key": "secret-key"},
+        json={"id": "test", "ack": False},
+    )
+    message_id = leased.json()["messages"][0]["message_id"]
+    ack = client.post(
+        "/ack_messages",
+        headers={"X-API-Key": "secret-key"},
+        json={"id": "test", "message_ids": [message_id]},
+    )
+    empty_after_ack = client.post(
+        "/recv_unread",
+        headers={"X-API-Key": "secret-key"},
+        json={"id": "test", "ack": False},
+    )
+
+    app.dependency_overrides.clear()
+
+    assert leased.status_code == 200
+    assert leased.json()["ack_required"] is True
+    assert leased.json()["messages"][0]["text"] == "leased"
+    assert empty_while_leased.json()["messages"] == []
+    assert ack.status_code == 200
+    assert ack.json()["acked"] == 1
+    assert empty_after_ack.json()["messages"] == []
+    assert ("om_2", "Get") in fake.reactions
+
+
+def test_ready_reports_database_status(tmp_path):
+    client, _ = make_client(tmp_path)
+
+    response = client.get("/ready")
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["checks"]["database"]["ok"] is True
 
 
 def test_business_api_requires_key(tmp_path):

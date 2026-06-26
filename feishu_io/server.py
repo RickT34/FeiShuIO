@@ -13,8 +13,10 @@ from feishu_io.config import Settings, get_settings
 from feishu_io.events import extract_text_message
 from feishu_io.feishu import FeishuAppClient, FeishuAppError
 from feishu_io.handlers import handle_incoming_message
-from feishu_io.listener import start_listener_thread, stop_listener_thread
+from feishu_io.listener import listener_status, start_listener_thread, stop_listener_thread
 from feishu_io.models import (
+    AckMessagesRequest,
+    AckMessagesResponse,
     RecvUnreadRequest,
     RecvUnreadResponse,
     SendMarkdownRequest,
@@ -29,6 +31,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    MessageStore(settings.db_path).cleanup(
+        delivered_retention_days=settings.delivered_retention_days,
+        processed_retention_days=settings.processed_retention_days,
+    )
     if settings.enable_ws_listener:
         start_listener_thread()
     try:
@@ -52,12 +58,41 @@ def get_feishu_client() -> FeishuAppClient:
     return FeishuAppClient(
         app_id=settings.feishu_app_id,
         app_secret=settings.feishu_app_secret,
+        retry_attempts=settings.feishu_retry_attempts,
+        retry_base_delay=settings.feishu_retry_base_delay,
     )
 
 
 @app.get("/health")
 async def health() -> dict[str, bool]:
     return {"ok": True}
+
+
+@app.get("/ready")
+async def ready(
+    store: MessageStore = Depends(get_store),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    checks: dict[str, Any] = {}
+    try:
+        checks["database"] = store.health_check()
+    except Exception as exc:
+        checks["database"] = {"ok": False, "error": str(exc)}
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"ok": False, "checks": checks},
+        ) from exc
+
+    if settings.enable_ws_listener:
+        status_payload = listener_status()
+        checks["listener"] = status_payload
+        if not status_payload["running"]:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"ok": False, "checks": checks},
+            )
+
+    return {"ok": True, "checks": checks}
 
 
 @app.post(
@@ -109,8 +144,13 @@ async def recv_unread(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"unknown id: {payload.id}; bind it in a Feishu group with /bind {payload.id}",
         )
-    messages = store.pop_unread(payload.id, payload.limit)
-    if settings.mark_read_reaction:
+    messages = store.pop_unread(
+        payload.id,
+        payload.limit,
+        ack=payload.ack,
+        lease_seconds=settings.message_lease_seconds,
+    )
+    if payload.ack and settings.mark_read_reaction:
         for message in messages:
             external_message_id = message.get("external_message_id")
             if not external_message_id:
@@ -130,7 +170,57 @@ async def recv_unread(
         ok=True,
         id=payload.id,
         messages=messages,
+        ack_required=not payload.ack,
     )
+
+
+@app.post(
+    "/ack_messages",
+    response_model=AckMessagesResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def ack_messages(
+    payload: AckMessagesRequest,
+    store: MessageStore = Depends(get_store),
+    settings: Settings = Depends(get_settings),
+    client: FeishuAppClient = Depends(get_feishu_client),
+) -> AckMessagesResponse:
+    if not store.resolve_alias(payload.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown id: {payload.id}; bind it in a Feishu group with /bind {payload.id}",
+        )
+
+    acked_messages = store.ack_messages(payload.id, payload.message_ids)
+    if settings.mark_read_reaction:
+        for message in acked_messages:
+            external_message_id = message.get("external_message_id")
+            if not external_message_id:
+                continue
+            try:
+                await client.add_reaction(
+                    message_id=external_message_id,
+                    emoji_type=settings.read_reaction_emoji,
+                )
+            except FeishuAppError:
+                logger.exception(
+                    "failed to add read reaction to leased message %s",
+                    external_message_id,
+                )
+
+    return AckMessagesResponse(ok=True, id=payload.id, acked=len(acked_messages))
+
+
+@app.post("/maintenance/cleanup", dependencies=[Depends(require_api_key)])
+async def cleanup(
+    store: MessageStore = Depends(get_store),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    deleted = store.cleanup(
+        delivered_retention_days=settings.delivered_retention_days,
+        processed_retention_days=settings.processed_retention_days,
+    )
+    return {"ok": True, **deleted}
 
 
 @app.post("/feishu/events")

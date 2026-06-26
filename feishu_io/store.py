@@ -9,7 +9,7 @@ from typing import Iterator
 from feishu_io.events import IncomingMessage
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class MessageStore:
@@ -77,6 +77,18 @@ class MessageStore:
                 ON unread_messages (group_id, delivered_at, message_id)
                 """
             )
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(unread_messages)").fetchall()
+            }
+            if "lease_until" not in columns:
+                conn.execute("ALTER TABLE unread_messages ADD COLUMN lease_until TEXT")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_unread_group_lease
+                ON unread_messages (group_id, delivered_at, lease_until, message_id)
+                """
+            )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def mark_processed(self, external_message_id: str | None) -> bool:
@@ -96,35 +108,50 @@ class MessageStore:
 
     def bind_group(self, *, alias: str, chat_id: str) -> bool:
         with self.connect() as conn:
-            existing = conn.execute(
-                """
-                SELECT chat_id
-                FROM group_bindings
-                WHERE alias = ?
-                """,
-                (alias,),
-            ).fetchone()
-            if existing and existing["chat_id"] == chat_id:
-                return False
+            return self._bind_group(conn, alias=alias, chat_id=chat_id)
 
-            conn.execute(
-                """
-                DELETE FROM group_bindings
-                WHERE chat_id = ? AND alias != ?
-                """,
-                (chat_id, alias),
-            )
-            conn.execute(
-                """
-                INSERT INTO group_bindings (alias, chat_id)
-                VALUES (?, ?)
-                ON CONFLICT(alias) DO UPDATE SET
-                    chat_id = excluded.chat_id,
-                    updated_at = datetime('now')
-                """,
-                (alias, chat_id),
-            )
-            return True
+    def bind_group_once(
+        self,
+        *,
+        external_message_id: str | None,
+        alias: str,
+        chat_id: str,
+    ) -> tuple[bool, bool]:
+        with self.connect() as conn:
+            if not self._mark_processed(conn, external_message_id):
+                return False, False
+            return True, self._bind_group(conn, alias=alias, chat_id=chat_id)
+
+    def _bind_group(self, conn: sqlite3.Connection, *, alias: str, chat_id: str) -> bool:
+        existing = conn.execute(
+            """
+            SELECT chat_id
+            FROM group_bindings
+            WHERE alias = ?
+            """,
+            (alias,),
+        ).fetchone()
+        if existing and existing["chat_id"] == chat_id:
+            return False
+
+        conn.execute(
+            """
+            DELETE FROM group_bindings
+            WHERE chat_id = ? AND alias != ?
+            """,
+            (chat_id, alias),
+        )
+        conn.execute(
+            """
+            INSERT INTO group_bindings (alias, chat_id)
+            VALUES (?, ?)
+            ON CONFLICT(alias) DO UPDATE SET
+                chat_id = excluded.chat_id,
+                updated_at = datetime('now')
+            """,
+            (alias, chat_id),
+        )
+        return True
 
     def resolve_alias(self, alias: str) -> str | None:
         with self.connect() as conn:
@@ -155,34 +182,75 @@ class MessageStore:
         message: IncomingMessage,
     ) -> int:
         with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO unread_messages (
-                    external_message_id, group_id, sender_id, sender_name,
-                    message_type, text, raw_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(external_message_id) DO NOTHING
-                """,
-                (
-                    message.external_message_id,
-                    message.group_id,
-                    message.sender_id,
-                    message.sender_name,
-                    message.message_type,
-                    message.text,
-                    json.dumps(message.raw, ensure_ascii=False),
-                ),
-            )
+            cursor = self._insert_message(conn, message)
             return int(cursor.lastrowid or 0)
 
-    def pop_unread(self, group_id: str, limit: int) -> list[dict]:
+    def add_message_once(self, message: IncomingMessage) -> bool:
+        with self.connect() as conn:
+            if not self._mark_processed(conn, message.external_message_id):
+                return False
+            cursor = self._insert_message(conn, message)
+            return cursor.rowcount > 0
+
+    def _mark_processed(
+        self,
+        conn: sqlite3.Connection,
+        external_message_id: str | None,
+    ) -> bool:
+        if not external_message_id:
+            return True
+
+        cursor = conn.execute(
+            """
+            INSERT INTO processed_messages (external_message_id)
+            VALUES (?)
+            ON CONFLICT(external_message_id) DO NOTHING
+            """,
+            (external_message_id,),
+        )
+        return cursor.rowcount > 0
+
+    def _insert_message(
+        self,
+        conn: sqlite3.Connection,
+        message: IncomingMessage,
+    ) -> sqlite3.Cursor:
+        return conn.execute(
+            """
+            INSERT INTO unread_messages (
+                external_message_id, group_id, sender_id, sender_name,
+                message_type, text, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(external_message_id) DO NOTHING
+            """,
+            (
+                message.external_message_id,
+                message.group_id,
+                message.sender_id,
+                message.sender_name,
+                message.message_type,
+                message.text,
+                json.dumps(message.raw, ensure_ascii=False),
+            ),
+        )
+
+    def pop_unread(
+        self,
+        group_id: str,
+        limit: int,
+        *,
+        ack: bool = True,
+        lease_seconds: int = 300,
+    ) -> list[dict]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
                 SELECT *
                 FROM unread_messages
-                WHERE group_id = ? AND delivered_at IS NULL
+                WHERE group_id = ?
+                  AND delivered_at IS NULL
+                  AND (lease_until IS NULL OR lease_until <= datetime('now'))
                 ORDER BY message_id ASC
                 LIMIT ?
                 """,
@@ -192,14 +260,24 @@ class MessageStore:
             message_ids = [row["message_id"] for row in rows]
             if message_ids:
                 placeholders = ",".join("?" for _ in message_ids)
-                conn.execute(
-                    f"""
-                    UPDATE unread_messages
-                    SET delivered_at = datetime('now')
-                    WHERE message_id IN ({placeholders})
-                    """,
-                    message_ids,
-                )
+                if ack:
+                    conn.execute(
+                        f"""
+                        UPDATE unread_messages
+                        SET delivered_at = datetime('now'), lease_until = NULL
+                        WHERE message_id IN ({placeholders})
+                        """,
+                        message_ids,
+                    )
+                else:
+                    conn.execute(
+                        f"""
+                        UPDATE unread_messages
+                        SET lease_until = datetime('now', '+' || ? || ' seconds')
+                        WHERE message_id IN ({placeholders})
+                        """,
+                        [lease_seconds, *message_ids],
+                    )
 
         return [
             {
@@ -215,3 +293,82 @@ class MessageStore:
             }
             for row in rows
         ]
+
+    def ack_messages(self, group_id: str, message_ids: list[int]) -> list[dict]:
+        if not message_ids:
+            return []
+
+        with self.connect() as conn:
+            placeholders = ",".join("?" for _ in message_ids)
+            rows = conn.execute(
+                f"""
+                SELECT message_id, external_message_id
+                FROM unread_messages
+                WHERE group_id = ?
+                  AND delivered_at IS NULL
+                  AND message_id IN ({placeholders})
+                """,
+                [group_id, *message_ids],
+            ).fetchall()
+            cursor = conn.execute(
+                f"""
+                UPDATE unread_messages
+                SET delivered_at = datetime('now'), lease_until = NULL
+                WHERE group_id = ?
+                  AND delivered_at IS NULL
+                  AND message_id IN ({placeholders})
+                """,
+                [group_id, *message_ids],
+            )
+            if cursor.rowcount <= 0:
+                return []
+        return [
+            {
+                "message_id": row["message_id"],
+                "external_message_id": row["external_message_id"],
+            }
+            for row in rows
+        ]
+
+    def cleanup(self, *, delivered_retention_days: int, processed_retention_days: int) -> dict:
+        with self.connect() as conn:
+            delivered = conn.execute(
+                """
+                DELETE FROM unread_messages
+                WHERE delivered_at IS NOT NULL
+                  AND delivered_at < datetime('now', '-' || ? || ' days')
+                """,
+                (delivered_retention_days,),
+            ).rowcount
+            processed = conn.execute(
+                """
+                DELETE FROM processed_messages
+                WHERE created_at < datetime('now', '-' || ? || ' days')
+                """,
+                (processed_retention_days,),
+            ).rowcount
+        return {
+            "delivered_messages_deleted": int(delivered),
+            "processed_messages_deleted": int(processed),
+        }
+
+    def health_check(self) -> dict:
+        with self.connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+            pending = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM unread_messages
+                WHERE delivered_at IS NULL
+                """
+            ).fetchone()["count"]
+            leased = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM unread_messages
+                WHERE delivered_at IS NULL
+                  AND lease_until IS NOT NULL
+                  AND lease_until > datetime('now')
+                """
+            ).fetchone()["count"]
+        return {"ok": True, "pending_messages": int(pending), "leased_messages": int(leased)}

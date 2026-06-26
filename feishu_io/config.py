@@ -22,7 +22,26 @@ class Settings(BaseSettings):
     feishu_event_encrypt_key: str | None = Field(None, alias="FEISHU_EVENT_ENCRYPT_KEY")
     enable_ws_listener: bool = Field(True, alias="FEISHU_IO_ENABLE_WS")
     mark_read_reaction: bool = Field(True, alias="FEISHU_MARK_READ_REACTION")
-    read_reaction_emoji: str = Field("OK", alias="FEISHU_READ_REACTION_EMOJI")
+    read_reaction_emoji: str = Field("Get", alias="FEISHU_READ_REACTION_EMOJI")
+    feishu_retry_attempts: int = Field(3, ge=1, le=10, alias="FEISHU_RETRY_ATTEMPTS")
+    feishu_retry_base_delay: float = Field(
+        0.5, ge=0.0, le=30.0, alias="FEISHU_RETRY_BASE_DELAY"
+    )
+    listener_retry_base_delay: float = Field(
+        1.0, ge=0.0, le=300.0, alias="FEISHU_LISTENER_RETRY_BASE_DELAY"
+    )
+    listener_retry_max_delay: float = Field(
+        60.0, ge=0.0, le=3600.0, alias="FEISHU_LISTENER_RETRY_MAX_DELAY"
+    )
+    message_lease_seconds: int = Field(
+        300, ge=1, le=86400, alias="FEISHU_MESSAGE_LEASE_SECONDS"
+    )
+    delivered_retention_days: int = Field(
+        30, ge=1, le=3650, alias="FEISHU_DELIVERED_RETENTION_DAYS"
+    )
+    processed_retention_days: int = Field(
+        30, ge=1, le=3650, alias="FEISHU_PROCESSED_RETENTION_DAYS"
+    )
 
 
 @lru_cache

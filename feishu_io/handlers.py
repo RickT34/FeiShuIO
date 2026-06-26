@@ -23,13 +23,16 @@ async def handle_incoming_message(
     store: MessageStore,
     client: MarkdownSender | None = None,
 ) -> dict:
-    if not store.mark_processed(message.external_message_id):
-        return {"ok": True, "duplicate": True}
-
     chat_id = message.group_id
     alias = parse_bind_command(message.text)
     if alias:
-        changed = store.bind_group(alias=alias, chat_id=chat_id)
+        processed, changed = store.bind_group_once(
+            external_message_id=message.external_message_id,
+            alias=alias,
+            chat_id=chat_id,
+        )
+        if not processed:
+            return {"ok": True, "duplicate": True}
         if changed and client:
             try:
                 await client.send_markdown(
@@ -41,7 +44,8 @@ async def handle_incoming_message(
         return {"ok": True, "bound": alias, "changed": changed}
 
     destination_group = store.resolve_chat_id(chat_id) or chat_id
-    store.add_message(message.for_group(destination_group))
+    if not store.add_message_once(message.for_group(destination_group)):
+        return {"ok": True, "duplicate": True}
     return {"ok": True}
 
 

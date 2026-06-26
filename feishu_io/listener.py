@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -57,13 +58,18 @@ class ListenerService:
         self._settings_factory = settings_factory
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._ws_client: Any | None = None
+        self._last_started_at: float | None = None
+        self._last_stopped_at: float | None = None
+        self._last_error: str | None = None
 
     def start(self) -> threading.Thread:
         with self._lock:
             if self._thread and self._thread.is_alive():
                 return self._thread
 
+            self._stop_event.clear()
             self._thread = threading.Thread(
                 target=self.run,
                 name="feishu-ws-listener",
@@ -73,6 +79,7 @@ class ListenerService:
             return self._thread
 
     def stop(self, timeout: float = 5.0) -> None:
+        self._stop_event.set()
         ws_client = self._ws_client
         for method_name in ("stop", "close"):
             method = getattr(ws_client, method_name, None)
@@ -88,17 +95,40 @@ class ListenerService:
             thread.join(timeout=timeout)
 
     def run(self) -> None:
-        try:
-            self._run_once()
-        except Exception:
-            logger.exception("Feishu ws listener stopped unexpectedly")
+        delay: float | None = None
+        while not self._stop_event.is_set():
+            settings = self._settings_factory()
+            if delay is None:
+                delay = settings.listener_retry_base_delay
+            try:
+                self._last_started_at = time.time()
+                self._last_error = None
+                self._run_once(settings)
+                self._last_stopped_at = time.time()
+                if not self._stop_event.is_set():
+                    logger.warning("Feishu ws listener stopped; restarting")
+            except Exception as exc:
+                self._last_stopped_at = time.time()
+                self._last_error = str(exc)
+                logger.exception("Feishu ws listener stopped unexpectedly")
 
-    def _run_once(self) -> None:
-        settings = self._settings_factory()
+            if self._stop_event.is_set():
+                break
+
+            wait_seconds = min(delay, settings.listener_retry_max_delay)
+            logger.info("restarting Feishu ws listener in %.1fs", wait_seconds)
+            self._stop_event.wait(wait_seconds)
+            delay = min(delay * 2, settings.listener_retry_max_delay)
+        self._ws_client = None
+
+    def _run_once(self, settings: Settings | None = None) -> None:
+        settings = settings or self._settings_factory()
         store = MessageStore(settings.db_path)
         client = FeishuAppClient(
             app_id=settings.feishu_app_id,
             app_secret=settings.feishu_app_secret,
+            retry_attempts=settings.feishu_retry_attempts,
+            retry_base_delay=settings.feishu_retry_base_delay,
         )
         handler = build_event_handler(settings=settings, store=store, client=client)
         self._ws_client = lark.ws.Client(
@@ -107,6 +137,15 @@ class ListenerService:
             event_handler=handler,
         )
         self._ws_client.start()
+
+    def status(self) -> dict[str, Any]:
+        thread = self._thread
+        return {
+            "running": bool(thread and thread.is_alive()),
+            "last_started_at": self._last_started_at,
+            "last_stopped_at": self._last_stopped_at,
+            "last_error": self._last_error,
+        }
 
 
 listener_service = ListenerService()
@@ -122,6 +161,10 @@ def start_listener_thread() -> threading.Thread:
 
 def stop_listener_thread(timeout: float = 5.0) -> None:
     listener_service.stop(timeout=timeout)
+
+
+def listener_status() -> dict[str, Any]:
+    return listener_service.status()
 
 
 def main() -> None:

@@ -73,14 +73,29 @@ FEISHU_APP_SECRET=xxxx
 FEISHU_EVENT_VERIFY_TOKEN=xxxx
 FEISHU_EVENT_ENCRYPT_KEY=
 FEISHU_MARK_READ_REACTION=true
-FEISHU_READ_REACTION_EMOJI=OK
+FEISHU_READ_REACTION_EMOJI=Get
+FEISHU_RETRY_ATTEMPTS=3
+FEISHU_RETRY_BASE_DELAY=0.5
+FEISHU_LISTENER_RETRY_BASE_DELAY=1
+FEISHU_LISTENER_RETRY_MAX_DELAY=60
+FEISHU_MESSAGE_LEASE_SECONDS=300
+FEISHU_DELIVERED_RETENTION_DAYS=30
+FEISHU_PROCESSED_RETENTION_DAYS=30
 ```
 
 `FEISHU_IO_API_KEY` 是本服务业务接口的访问 key，用来防止信息泄露。
 
 `FEISHU_IO_ENABLE_WS=true` 表示启动 REST 服务时自动启动飞书长连接监听。大多数单机部署保持默认即可。
 
-`FEISHU_MARK_READ_REACTION=true` 表示 `recv_unread` 成功取走缓存消息后，会给飞书原消息添加一个 reaction，默认 emoji 类型是 `OK`。如果飞书侧权限或 emoji 类型不支持，接口仍会返回消息，只在服务日志里记录失败原因。
+`FEISHU_MARK_READ_REACTION=true` 表示 `recv_unread` 成功取走缓存消息后，会给飞书原消息添加一个 reaction，默认 emoji 类型是 `Get`。如果飞书侧权限或 emoji 类型不支持，接口仍会返回消息，只在服务日志里记录失败原因。
+
+`FEISHU_RETRY_ATTEMPTS` 和 `FEISHU_RETRY_BASE_DELAY` 控制飞书 HTTP API 的有限重试，用于处理临时网络错误、429 和 5xx。
+
+`FEISHU_LISTENER_RETRY_BASE_DELAY` 和 `FEISHU_LISTENER_RETRY_MAX_DELAY` 控制长连接监听异常退出后的自动重连退避。
+
+`FEISHU_MESSAGE_LEASE_SECONDS` 控制可靠读取模式下消息租约时长。租约过期且未确认的消息会重新出现在 `recv_unread` 结果里。
+
+`FEISHU_DELIVERED_RETENTION_DAYS` 和 `FEISHU_PROCESSED_RETENTION_DAYS` 控制启动和手动清理时保留已投递消息、去重记录的天数。
 
 ## 启动
 
@@ -170,7 +185,42 @@ curl -X POST http://127.0.0.1:8000/recv_unread \
 }
 ```
 
-`recv_unread` 会把返回的消息标记为本地已读；同一批消息不会在下一次调用里重复返回。默认还会给飞书原消息添加 `OK` reaction，方便群里用户知道这条消息已经被下游应用取走。
+`recv_unread` 会把返回的消息标记为本地已读；同一批消息不会在下一次调用里重复返回。默认还会给飞书原消息添加 `Get` reaction，方便群里用户知道这条消息已经被下游应用取走。
+
+如果下游程序需要更可靠的无人值守读取，可以传 `ack=false`：
+
+```bash
+curl -X POST http://127.0.0.1:8000/recv_unread \
+  -H "X-API-Key: change-this-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"test","limit":100,"ack":false}'
+```
+
+这时消息只会被临时租出，不会立刻标记为已读。下游处理成功后调用：
+
+```bash
+curl -X POST http://127.0.0.1:8000/ack_messages \
+  -H "X-API-Key: change-this-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"test","message_ids":[1,2,3]}'
+```
+
+如果下游崩溃，没有及时确认，租约过期后这些消息会再次返回。
+
+## 健康检查和维护
+
+`GET /health` 是浅健康检查，只表示 HTTP 进程仍能响应。
+
+`GET /ready` 会检查 SQLite，并在启用内置长连接监听时检查监听线程是否还活着。无人值守部署建议把 `/ready` 接到 systemd、Docker healthcheck 或外部监控。
+
+可以手动清理历史数据：
+
+```bash
+curl -X POST http://127.0.0.1:8000/maintenance/cleanup \
+  -H "X-API-Key: change-this-api-key"
+```
+
+服务启动时也会按保留天数自动清理一次已投递消息和去重记录。
 
 ## 消息监听
 
