@@ -132,6 +132,61 @@ X-API-Key: change-this-api-key
 Authorization: Bearer change-this-api-key
 ```
 
+## Python 和命令行工具
+
+安装本项目后，会同时提供一个轻量 Python 客户端和命令行工具，避免手动构造请求体。
+
+Python 调用：
+
+```python
+from feishu_io import FeishuIO
+
+bot = FeishuIO("http://127.0.0.1:8000", api_key="change-this-api-key")
+bot.send_markdown("**训练完成**\n\n结果已写入 `runs/latest`。", "test")
+
+messages = bot.recv_unread("test")
+for message in messages:
+    print(message["text"])
+```
+
+也可以用环境变量：
+
+```bash
+export FEISHU_IO_URL=http://127.0.0.1:8000
+export FEISHU_IO_API_KEY=change-this-api-key
+```
+
+命令行发送：
+
+```bash
+feishu-ioctl send test '**训练完成**'
+```
+
+从 stdin 发送多行 Markdown：
+
+```bash
+cat report.md | feishu-ioctl send test -
+```
+
+读取未读消息：
+
+```bash
+feishu-ioctl recv test
+```
+
+可靠读取模式：
+
+```bash
+feishu-ioctl recv test --no-ack
+feishu-ioctl ack test 1 2 3
+```
+
+健康检查：
+
+```bash
+feishu-ioctl ready
+```
+
 ## 发送 Markdown
 
 ```bash

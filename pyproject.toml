@@ -24,6 +24,7 @@ test = [
 [project.scripts]
 feishu-io = "feishu_io.server:main"
 feishu-io-listener = "feishu_io.listener:main"
+feishu-ioctl = "feishu_io.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["feishu_io*"]
