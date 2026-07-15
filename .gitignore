@@ -1,6 +1,8 @@
 .env
 .venv/
 .server-venv/
+.client-venv/
+.client/
 __pycache__/
 *.py[cod]
 .pytest_cache/

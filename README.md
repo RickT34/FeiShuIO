@@ -169,77 +169,58 @@ Authorization: Bearer change-this-api-key
 
 ## Client 单命令调用
 
-在需要调用消息的机器上，只安装 client：
+Client 不需要安装到系统或用户目录。虚拟环境、配置都保存在当前仓库内，所有操作统一使用：
 
 ```bash
-./scripts/install-client.sh
+./scripts/client.sh <command>
 ```
 
-脚本把隔离环境安装到 `~/.local/share/feishu-io-client`，并创建 `~/.local/bin/feishu-ioctl`。也可以直接使用 `pipx install .` 或 `pip install .`；默认安装不包含任何 Server 依赖。
+脚本首次运行时自动创建 `.client-venv` 并安装轻量 Client 依赖，后续直接执行命令。Client 配置固定保存在 `.client/client.json`，缓存固定保存在 `.client/cache`；这些目录均已加入 `.gitignore`，不会写入仓库外目录，也不会误提交密钥。脚本拒绝 `--config` 覆盖，避免 agent 意外把配置写到其他位置。
 
 首次配置一次 URL 和 key。用 stdin 可以避免 key 出现在 shell history 中：
 
 ```bash
 printf '%s' 'change-this-api-key' | \
-  feishu-ioctl configure https://feishu-io.example.com --key-stdin
-feishu-ioctl ready
+  ./scripts/client.sh configure https://feishu-io.example.com --key-stdin
+./scripts/client.sh ready
 ```
 
-配置默认保存在 `~/.config/feishu-io/client.json`，权限为 `0600`。`FEISHU_IO_URL`、`FEISHU_IO_API_KEY` 或命令行 `--url`、`--key` 可以临时覆盖它；`FEISHU_IO_CONFIG` 可以指定另一份配置文件。
+配置文件权限为 `0600`，配置目录权限为 `0700`。可以运行 `./scripts/client.sh config` 查看当前使用的 Server URL；该命令不会输出 API key。
 
 发送消息只需要一条命令：
 
 ```bash
-feishu-ioctl send test '**训练完成**'
-cat report.md | feishu-ioctl send test -
+./scripts/client.sh send test '**训练完成**'
+cat report.md | ./scripts/client.sh send test -
 ```
 
 立即读取当前未读消息：
 
 ```bash
-feishu-ioctl recv test
+./scripts/client.sh recv test
 ```
 
 等待最多 60 秒，适合 agent 等待下一条指令：
 
 ```bash
-feishu-ioctl recv test --wait 60
+./scripts/client.sh recv test --wait 60
 ```
 
 需要“处理成功后才删除”的无人值守任务，应使用租约模式：
 
 ```bash
-feishu-ioctl recv test --wait 60 --no-ack
-feishu-ioctl ack test LEASE_TOKEN 1 2 3
+./scripts/client.sh recv test --wait 60 --no-ack
+./scripts/client.sh ack test LEASE_TOKEN 1 2 3
 ```
 
-所有命令输出 JSON，失败时返回非零退出码并把错误写到 stderr，便于 agent 或 shell 脚本判断。
-
-Python Client 使用相同配置文件，也可以显式传参：
-
-```python
-from feishu_io import FeishuIO
-
-bot = FeishuIO()  # 读取已保存的 client 配置
-bot.send_markdown("**训练完成**\n\n结果已写入 `runs/latest`。", "test")
-
-messages = bot.recv_unread("test")
-for message in messages:
-    print(message["text"])
-```
-
-或者显式传入：
-
-```python
-bot = FeishuIO("https://feishu-io.example.com", api_key="change-this-api-key")
-```
+所有命令输出 JSON，失败时返回非零退出码并把错误写到 stderr，便于 agent 或 shell 脚本判断。为保证环境与数据边界一致，自动化调用统一使用 `scripts/client.sh`，不要直接调用内部的 `feishu-ioctl`。
 
 `LEASE_TOKEN` 是 `recv --no-ack` 返回的消息中的 `lease_token`。它只对当前租约有效，租约过期或消息被重新租出后不能再确认。
 
 健康检查：
 
 ```bash
-feishu-ioctl ready
+./scripts/client.sh ready
 ```
 
 ## 发送 Markdown
