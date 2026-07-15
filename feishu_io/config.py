@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     feishu_app_id: str = Field(..., alias="FEISHU_APP_ID")
     feishu_app_secret: str = Field(..., alias="FEISHU_APP_SECRET")
     db_path: str = Field("feishu_io.sqlite3", alias="FEISHU_IO_DB")
+    host: str = Field("0.0.0.0", min_length=1, alias="FEISHU_IO_HOST")
+    port: int = Field(8000, ge=1, le=65535, alias="FEISHU_IO_PORT")
+    log_level: str = Field("info", min_length=1, alias="FEISHU_IO_LOG_LEVEL")
     feishu_event_verify_token: str | None = Field(
         None, alias="FEISHU_EVENT_VERIFY_TOKEN"
     )

@@ -42,6 +42,51 @@ def test_server_cli_passes_runtime_options_to_uvicorn(monkeypatch):
     ]
 
 
+def test_server_cli_reads_runtime_options_from_dotenv(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "FEISHU_IO_API_KEY=test-key",
+                "FEISHU_APP_ID=cli_test",
+                "FEISHU_APP_SECRET=test-secret",
+                "FEISHU_IO_HOST=127.0.0.1",
+                "FEISHU_IO_PORT=18000",
+                "FEISHU_IO_LOG_LEVEL=warning",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FEISHU_IO_HOST", raising=False)
+    monkeypatch.delenv("FEISHU_IO_PORT", raising=False)
+    monkeypatch.delenv("FEISHU_IO_LOG_LEVEL", raising=False)
+    monkeypatch.setattr(sys, "argv", ["feishu-io-server"])
+    calls = []
+    monkeypatch.setattr(
+        server.uvicorn,
+        "run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    server.get_settings.cache_clear()
+
+    try:
+        server.main()
+    finally:
+        server.get_settings.cache_clear()
+
+    assert calls == [
+        (
+            ("feishu_io.server:app",),
+            {
+                "host": "127.0.0.1",
+                "port": 18000,
+                "log_level": "warning",
+                "reload": False,
+            },
+        )
+    ]
+
+
 def test_client_only_install_explains_missing_server_dependencies(monkeypatch):
     real_import = __import__
 

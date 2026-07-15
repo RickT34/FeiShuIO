@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
@@ -280,19 +279,21 @@ def main() -> None:
         prog="feishu-io-server",
         description="Run the persistent FeiShuIO REST and Feishu listener service.",
     )
-    parser.add_argument("--host", default=os.getenv("FEISHU_IO_HOST", "0.0.0.0"))
-    parser.add_argument(
-        "--port", type=int, default=int(os.getenv("FEISHU_IO_PORT", "8000"))
-    )
-    parser.add_argument(
-        "--log-level", default=os.getenv("FEISHU_IO_LOG_LEVEL", "info")
-    )
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--log-level", default=None)
     args = parser.parse_args()
+
+    settings: Settings | None = None
+    if args.host is None or args.port is None or args.log_level is None:
+        settings = get_settings()
     uvicorn.run(
         "feishu_io.server:app",
-        host=args.host,
-        port=args.port,
-        log_level=args.log_level,
+        host=args.host if args.host is not None else settings.host,
+        port=args.port if args.port is not None else settings.port,
+        log_level=(
+            args.log_level if args.log_level is not None else settings.log_level
+        ),
         reload=False,
     )
 
