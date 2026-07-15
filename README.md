@@ -89,7 +89,7 @@ FEISHU_PROCESSED_RETENTION_DAYS=30
 
 `FEISHU_MARK_READ_REACTION=true` 表示 `recv_unread` 成功取走缓存消息后，会给飞书原消息添加一个 reaction，默认 emoji 类型是 `Get`。如果飞书侧权限或 emoji 类型不支持，接口仍会返回消息，只在服务日志里记录失败原因。
 
-`FEISHU_RETRY_ATTEMPTS` 和 `FEISHU_RETRY_BASE_DELAY` 控制飞书 HTTP API 的有限重试，用于处理临时网络错误、429 和 5xx。
+`FEISHU_RETRY_ATTEMPTS` 和 `FEISHU_RETRY_BASE_DELAY` 控制飞书 HTTP API 的有限重试，用于处理临时网络错误、429 和 5xx。发送消息会携带飞书 `uuid` 幂等键后再重试；没有幂等保证的写操作不会自动重放。
 
 `FEISHU_LISTENER_RETRY_BASE_DELAY` 和 `FEISHU_LISTENER_RETRY_MAX_DELAY` 控制长连接监听异常退出后的自动重连退避。
 
@@ -116,7 +116,7 @@ FEISHU_IO_ENABLE_WS=false uvicorn feishu_io.server:app --host 0.0.0.0 --port 800
 feishu-io-listener
 ```
 
-单机部署建议只跑一个长连接监听进程。REST 服务内置的监听器会防止同一进程内重复启动，并在服务关闭时尝试关闭底层长连接客户端。多实例同时连接时，飞书会把同一个事件随机投递给其中一个连接。
+单机部署建议只跑一个长连接监听进程。REST 服务内置的监听器会防止同一进程内重复启动，并在服务关闭时关闭底层长连接和监听线程。多实例同时连接时，飞书会把同一个事件随机投递给其中一个连接。
 
 ## API 认证
 
@@ -178,8 +178,10 @@ feishu-ioctl recv test
 
 ```bash
 feishu-ioctl recv test --no-ack
-feishu-ioctl ack test 1 2 3
+feishu-ioctl ack test LEASE_TOKEN 1 2 3
 ```
+
+`LEASE_TOKEN` 是 `recv --no-ack` 返回的消息中的 `lease_token`。它只对当前租约有效，租约过期或消息被重新租出后不能再确认。
 
 健康检查：
 
@@ -234,7 +236,8 @@ curl -X POST http://127.0.0.1:8000/recv_unread \
       "message_type": "text",
       "text": "hello",
       "raw": {},
-      "created_at": "2026-06-25 10:00:00"
+      "created_at": "2026-06-25 10:00:00",
+      "lease_token": null
     }
   ]
 }
@@ -251,22 +254,22 @@ curl -X POST http://127.0.0.1:8000/recv_unread \
   -d '{"id":"test","limit":100,"ack":false}'
 ```
 
-这时消息只会被临时租出，不会立刻标记为已读。下游处理成功后调用：
+这时消息只会被临时租出，不会立刻标记为已读。每条返回消息都包含本批次的 `lease_token`。下游处理成功后使用同一个令牌调用：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/ack_messages \
   -H "X-API-Key: change-this-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"id":"test","message_ids":[1,2,3]}'
+  -d '{"id":"test","message_ids":[1,2,3],"lease_token":"0123456789abcdef0123456789abcdef"}'
 ```
 
-如果下游崩溃，没有及时确认，租约过期后这些消息会再次返回。
+如果下游崩溃，没有及时确认，租约过期后这些消息会再次返回，并生成新的租约令牌。领取和确认都在 SQLite 单条原子更新中完成，因此多个消费者不会领取或确认彼此的租约。
 
 ## 健康检查和维护
 
 `GET /health` 是浅健康检查，只表示 HTTP 进程仍能响应。
 
-`GET /ready` 会检查 SQLite，并在启用内置长连接监听时检查监听线程是否还活着。无人值守部署建议把 `/ready` 接到 systemd、Docker healthcheck 或外部监控。
+`GET /ready` 会检查 SQLite，并在启用内置长连接监听时检查飞书 WebSocket 是否真实连接；仅有重试线程存活不会被视为就绪。无人值守部署建议把 `/ready` 接到 systemd、Docker healthcheck 或外部监控。
 
 可以手动清理历史数据：
 
@@ -282,8 +285,8 @@ curl -X POST http://127.0.0.1:8000/maintenance/cleanup \
 飞书会通过长连接把消息事件推给本服务。本服务会处理两类消息：
 
 - `/bind alias`：绑定当前群。
-- 其他文本消息：写入该群 alias 对应的未读队列。
+- 其他文本消息：按稳定的飞书 `chat_id` 写入未读队列，读取时再解析 alias。
 
-如果某个群还没有绑定，消息会按原始 `chat_id` 暂存，但业务接口仍要求使用已绑定 alias。
+如果某个群还没有绑定，消息会按原始 `chat_id` 暂存；之后完成绑定或更换 alias，不会丢失已经排队的消息。
 
-项目仍保留 `POST /feishu/events` 作为兼容入口；如果以后你有公网域名，也可以切回传统 HTTP 回调。但没有公网 IP 时，只需要长连接模式。
+项目仍保留 `POST /feishu/events` 作为兼容入口；如果以后你有公网域名，也可以切回传统 HTTP 回调。该入口只在配置了 `FEISHU_EVENT_VERIFY_TOKEN` 时启用，并由飞书 SDK 统一完成 token、签名和加密载荷校验。没有公网 IP 时，只需要长连接模式。

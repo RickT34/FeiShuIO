@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -7,13 +8,18 @@ from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import Response
+from lark_oapi.core.model import RawRequest
 
 from feishu_io.auth import require_api_key
 from feishu_io.config import Settings, get_settings
-from feishu_io.events import extract_text_message
 from feishu_io.feishu import FeishuAppClient, FeishuAppError
-from feishu_io.handlers import handle_incoming_message
-from feishu_io.listener import listener_status, start_listener_thread, stop_listener_thread
+from feishu_io.listener import (
+    build_event_handler,
+    listener_status,
+    start_listener_thread,
+    stop_listener_thread,
+)
 from feishu_io.models import (
     AckMessagesRequest,
     AckMessagesResponse,
@@ -44,7 +50,7 @@ async def lifespan(app: FastAPI):
             stop_listener_thread()
 
 
-app = FastAPI(title="FeiShuIO", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="FeiShuIO", version="0.2.0", lifespan=lifespan)
 
 
 @lru_cache
@@ -86,7 +92,7 @@ async def ready(
     if settings.enable_ws_listener:
         status_payload = listener_status()
         checks["listener"] = status_payload
-        if not status_payload["running"]:
+        if not status_payload["connected"]:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"ok": False, "checks": checks},
@@ -139,17 +145,20 @@ async def recv_unread(
     settings: Settings = Depends(get_settings),
     client: FeishuAppClient = Depends(get_feishu_client),
 ) -> RecvUnreadResponse:
-    if not store.resolve_alias(payload.id):
+    chat_id = store.resolve_alias(payload.id)
+    if not chat_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"unknown id: {payload.id}; bind it in a Feishu group with /bind {payload.id}",
         )
     messages = store.pop_unread(
-        payload.id,
+        chat_id,
         payload.limit,
         ack=payload.ack,
         lease_seconds=settings.message_lease_seconds,
     )
+    for message in messages:
+        message["id"] = payload.id
     if payload.ack and settings.mark_read_reaction:
         for message in messages:
             external_message_id = message.get("external_message_id")
@@ -185,13 +194,18 @@ async def ack_messages(
     settings: Settings = Depends(get_settings),
     client: FeishuAppClient = Depends(get_feishu_client),
 ) -> AckMessagesResponse:
-    if not store.resolve_alias(payload.id):
+    chat_id = store.resolve_alias(payload.id)
+    if not chat_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"unknown id: {payload.id}; bind it in a Feishu group with /bind {payload.id}",
         )
 
-    acked_messages = store.ack_messages(payload.id, payload.message_ids)
+    acked_messages = store.ack_messages(
+        chat_id,
+        payload.message_ids,
+        lease_token=payload.lease_token,
+    )
     if settings.mark_read_reaction:
         for message in acked_messages:
             external_message_id = message.get("external_message_id")
@@ -229,38 +243,34 @@ async def feishu_events(
     store: MessageStore = Depends(get_store),
     settings: Settings = Depends(get_settings),
     client: FeishuAppClient = Depends(get_feishu_client),
-) -> dict[str, Any]:
-    payload = await request.json()
-
-    if payload.get("type") == "url_verification":
-        token = payload.get("token")
-        if (
-            settings.feishu_event_verify_token
-            and token != settings.feishu_event_verify_token
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="invalid Feishu verification token",
-            )
-        return {"challenge": payload.get("challenge")}
-
-    header = payload.get("header") if isinstance(payload.get("header"), dict) else {}
-    token = payload.get("token") or header.get("token")
-    if settings.feishu_event_verify_token and token != settings.feishu_event_verify_token:
+) -> Response:
+    if not settings.feishu_event_verify_token:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="invalid Feishu verification token",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="HTTP event callback is disabled because no verification token is configured",
         )
 
-    message = extract_text_message(payload)
-    if message:
-        return await handle_incoming_message(
-            message=message,
-            store=store,
-            client=client,
-        )
+    raw_request = RawRequest()
+    raw_request.uri = request.url.path
+    raw_request.body = await request.body()
+    raw_request.headers = dict(request.headers)
+    for header_name in (
+        "X-Lark-Request-Timestamp",
+        "X-Lark-Request-Nonce",
+        "X-Lark-Signature",
+        "X-Request-Id",
+    ):
+        value = request.headers.get(header_name)
+        if value is not None:
+            raw_request.headers[header_name] = value
 
-    return {"ok": True}
+    dispatcher = build_event_handler(settings=settings, store=store, client=client)
+    raw_response = await asyncio.to_thread(dispatcher.do, raw_request)
+    return Response(
+        content=raw_response.content or b"",
+        status_code=raw_response.status_code or status.HTTP_500_INTERNAL_SERVER_ERROR,
+        headers=raw_response.headers,
+    )
 
 
 def main() -> None:

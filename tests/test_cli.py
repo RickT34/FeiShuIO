@@ -19,8 +19,8 @@ class FakeClient:
         self.calls.append(("recv", id, limit, ack))
         return {"ok": True, "id": id, "messages": []}
 
-    def ack_messages(self, id, message_ids):
-        self.calls.append(("ack", id, message_ids))
+    def ack_messages(self, id, message_ids, *, lease_token):
+        self.calls.append(("ack", id, message_ids, lease_token))
         return {"ok": True, "id": id, "acked": len(message_ids)}
 
     def health(self):
@@ -59,9 +59,11 @@ def test_cli_ack(monkeypatch, capsys):
     FakeClient.calls = []
     monkeypatch.setattr(cli, "FeishuIO", FakeClient)
 
-    exit_code = cli.main(["--key", "k", "ack", "test", "1", "2"])
+    lease_token = "a" * 32
+    exit_code = cli.main(
+        ["--key", "k", "ack", "test", lease_token, "1", "2"]
+    )
 
     assert exit_code == 0
-    assert FakeClient.calls == [("ack", "test", [1, 2])]
+    assert FakeClient.calls == [("ack", "test", [1, 2], lease_token)]
     assert json.loads(capsys.readouterr().out)["acked"] == 2
-

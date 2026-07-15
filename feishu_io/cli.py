@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ack = subparsers.add_parser("ack", help="Acknowledge leased message ids.")
     ack.add_argument("id")
+    ack.add_argument("lease_token", help="Lease token returned by recv --no-ack.")
     ack.add_argument("message_ids", nargs="+", type=int)
 
     subparsers.add_parser("health", help="Call /health.")
@@ -79,7 +80,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         elif args.command == "ack":
-            _print_json(client.ack_messages(args.id, args.message_ids))
+            _print_json(
+                client.ack_messages(
+                    args.id,
+                    args.message_ids,
+                    lease_token=args.lease_token,
+                )
+            )
         elif args.command == "health":
             _print_json(client.health())
         elif args.command == "ready":
@@ -97,4 +104,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feishu-io"
-version = "0.1.0"
+version = "0.2.0"
 description = "Minimal REST bridge for Feishu group markdown sending and unread message polling."
 requires-python = ">=3.10"
 dependencies = [

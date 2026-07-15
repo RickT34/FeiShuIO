@@ -56,3 +56,21 @@ def test_python_client_raises_for_http_error():
     with pytest.raises(FeishuIOError, match="404"):
         client.recv_unread("missing")
 
+
+def test_python_client_ack_includes_lease_token():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/ack_messages"
+        assert json.loads(request.content) == {
+            "id": "test",
+            "message_ids": [1, 2],
+            "lease_token": "a" * 32,
+        }
+        return httpx.Response(200, json={"ok": True, "id": "test", "acked": 2})
+
+    client = FeishuIO("http://feishuio.local", "secret", transport=make_transport(handler))
+
+    response = client.ack_messages(
+        "test", [1, 2], lease_token="a" * 32
+    )
+
+    assert response["acked"] == 2

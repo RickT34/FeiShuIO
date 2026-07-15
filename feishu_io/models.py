@@ -37,6 +37,7 @@ class UnreadMessage(BaseModel):
     text: str
     raw: dict
     created_at: str
+    lease_token: str | None = None
 
 
 class RecvUnreadResponse(BaseModel):
@@ -49,6 +50,7 @@ class RecvUnreadResponse(BaseModel):
 class AckMessagesRequest(BaseModel):
     id: str = Field(..., min_length=1, description="Bound Feishu group id.")
     message_ids: list[int] = Field(..., min_length=1, max_length=500)
+    lease_token: str = Field(..., min_length=32, max_length=64)
 
 
 class AckMessagesResponse(BaseModel):

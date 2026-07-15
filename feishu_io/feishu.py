@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from typing import Any
 
 import httpx
@@ -26,7 +27,12 @@ def _raise_for_feishu_http_error(response: httpx.Response) -> None:
         ) from exc
 
 
-def build_markdown_message_payload(*, chat_id: str, text: str) -> dict[str, Any]:
+def build_markdown_message_payload(
+    *,
+    chat_id: str,
+    text: str,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
     card = {
         "config": {"wide_screen_mode": True},
         "elements": [
@@ -36,11 +42,14 @@ def build_markdown_message_payload(*, chat_id: str, text: str) -> dict[str, Any]
             }
         ],
     }
-    return {
+    payload = {
         "receive_id": chat_id,
         "msg_type": "interactive",
         "content": json.dumps(card, ensure_ascii=False),
     }
+    if idempotency_key:
+        payload["uuid"] = idempotency_key
+    return payload
 
 
 def build_reaction_payload(*, emoji_type: str) -> dict[str, Any]:
@@ -72,6 +81,7 @@ class FeishuAppClient:
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
+        retry_safe: bool = False,
     ) -> httpx.Response:
         last_error: Exception | None = None
         for attempt in range(1, self.retry_attempts + 1):
@@ -94,7 +104,7 @@ class FeishuAppClient:
             except httpx.RequestError as exc:
                 last_error = FeishuAppError(f"Feishu request failed: {exc}")
 
-            if attempt >= self.retry_attempts:
+            if not retry_safe or attempt >= self.retry_attempts:
                 break
 
             delay = self.retry_base_delay * (2 ** (attempt - 1))
@@ -121,6 +131,7 @@ class FeishuAppClient:
                 "app_id": self.app_id,
                 "app_secret": self.app_secret,
             },
+            retry_safe=True,
         )
 
         data = response.json()
@@ -137,13 +148,18 @@ class FeishuAppClient:
 
     async def send_markdown(self, *, chat_id: str, text: str) -> dict[str, Any]:
         token = await self.get_tenant_access_token()
-        payload = build_markdown_message_payload(chat_id=chat_id, text=text)
+        payload = build_markdown_message_payload(
+            chat_id=chat_id,
+            text=text,
+            idempotency_key=uuid.uuid4().hex,
+        )
 
         response = await self._post_json(
             "https://open.feishu.cn/open-apis/im/v1/messages",
             params={"receive_id_type": "chat_id"},
             headers={"Authorization": f"Bearer {token}"},
             json_body=payload,
+            retry_safe=True,
         )
 
         data = response.json()

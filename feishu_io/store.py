@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -9,7 +10,7 @@ from typing import Iterator
 from feishu_io.events import IncomingMessage
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class MessageStore:
@@ -37,6 +38,12 @@ class MessageStore:
     def init_db(self) -> None:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
+            current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if current_version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"database schema version {current_version} is newer than supported "
+                    f"version {SCHEMA_VERSION}"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS group_bindings (
@@ -67,7 +74,9 @@ class MessageStore:
                     text TEXT NOT NULL,
                     raw_json TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    delivered_at TEXT
+                    delivered_at TEXT,
+                    lease_until TEXT,
+                    lease_token TEXT
                 )
                 """
             )
@@ -83,6 +92,11 @@ class MessageStore:
             }
             if "lease_until" not in columns:
                 conn.execute("ALTER TABLE unread_messages ADD COLUMN lease_until TEXT")
+            if "lease_token" not in columns:
+                conn.execute("ALTER TABLE unread_messages ADD COLUMN lease_token TEXT")
+
+            if current_version < 3:
+                self._migrate_message_destinations(conn)
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_unread_group_lease
@@ -90,6 +104,40 @@ class MessageStore:
                 """
             )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _migrate_message_destinations(self, conn: sqlite3.Connection) -> None:
+        bindings = {
+            str(row["alias"]): str(row["chat_id"])
+            for row in conn.execute("SELECT alias, chat_id FROM group_bindings").fetchall()
+        }
+        rows = conn.execute(
+            "SELECT message_id, group_id, raw_json FROM unread_messages"
+        ).fetchall()
+        for row in rows:
+            chat_id = self._chat_id_from_raw_json(str(row["raw_json"]))
+            destination = chat_id or bindings.get(str(row["group_id"]))
+            if destination and destination != row["group_id"]:
+                conn.execute(
+                    "UPDATE unread_messages SET group_id = ? WHERE message_id = ?",
+                    (destination, row["message_id"]),
+                )
+
+    @staticmethod
+    def _chat_id_from_raw_json(raw_json: str) -> str | None:
+        try:
+            payload = json.loads(raw_json)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        event = payload.get("event")
+        if not isinstance(event, dict):
+            return None
+        message = event.get("message")
+        if not isinstance(message, dict):
+            return None
+        chat_id = message.get("chat_id")
+        return chat_id if isinstance(chat_id, str) and chat_id else None
 
     def mark_processed(self, external_message_id: str | None) -> bool:
         if not external_message_id:
@@ -133,6 +181,22 @@ class MessageStore:
         ).fetchone()
         if existing and existing["chat_id"] == chat_id:
             return False
+
+        if existing:
+            conn.execute(
+                "UPDATE unread_messages SET group_id = ? WHERE group_id = ?",
+                (existing["chat_id"], alias),
+            )
+
+        previous_alias = conn.execute(
+            "SELECT alias FROM group_bindings WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        if previous_alias:
+            conn.execute(
+                "UPDATE unread_messages SET group_id = ? WHERE group_id = ?",
+                (chat_id, previous_alias["alias"]),
+            )
 
         conn.execute(
             """
@@ -243,7 +307,9 @@ class MessageStore:
         ack: bool = True,
         lease_seconds: int = 300,
     ) -> list[dict]:
+        lease_token = None if ack else uuid.uuid4().hex
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
                 SELECT *
@@ -256,28 +322,32 @@ class MessageStore:
                 """,
                 (group_id, limit),
             ).fetchall()
-
             message_ids = [row["message_id"] for row in rows]
-            if message_ids:
-                placeholders = ",".join("?" for _ in message_ids)
-                if ack:
-                    conn.execute(
-                        f"""
-                        UPDATE unread_messages
-                        SET delivered_at = datetime('now'), lease_until = NULL
-                        WHERE message_id IN ({placeholders})
-                        """,
-                        message_ids,
-                    )
-                else:
-                    conn.execute(
-                        f"""
-                        UPDATE unread_messages
-                        SET lease_until = datetime('now', '+' || ? || ' seconds')
-                        WHERE message_id IN ({placeholders})
-                        """,
-                        [lease_seconds, *message_ids],
-                    )
+            if not message_ids:
+                return []
+
+            placeholders = ",".join("?" for _ in message_ids)
+            if ack:
+                conn.execute(
+                    f"""
+                    UPDATE unread_messages
+                    SET delivered_at = datetime('now'),
+                        lease_until = NULL,
+                        lease_token = NULL
+                    WHERE message_id IN ({placeholders})
+                    """,
+                    message_ids,
+                )
+            else:
+                conn.execute(
+                    f"""
+                    UPDATE unread_messages
+                    SET lease_until = datetime('now', '+' || ? || ' seconds'),
+                        lease_token = ?
+                    WHERE message_id IN ({placeholders})
+                    """,
+                    [lease_seconds, lease_token, *message_ids],
+                )
 
         return [
             {
@@ -290,15 +360,23 @@ class MessageStore:
                 "text": row["text"],
                 "raw": json.loads(row["raw_json"]),
                 "created_at": row["created_at"],
+                "lease_token": lease_token,
             }
-            for row in rows
+            for row in sorted(rows, key=lambda item: item["message_id"])
         ]
 
-    def ack_messages(self, group_id: str, message_ids: list[int]) -> list[dict]:
+    def ack_messages(
+        self,
+        group_id: str,
+        message_ids: list[int],
+        *,
+        lease_token: str,
+    ) -> list[dict]:
         if not message_ids:
             return []
 
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             placeholders = ",".join("?" for _ in message_ids)
             rows = conn.execute(
                 f"""
@@ -306,28 +384,33 @@ class MessageStore:
                 FROM unread_messages
                 WHERE group_id = ?
                   AND delivered_at IS NULL
+                  AND lease_token = ?
+                  AND lease_until > datetime('now')
                   AND message_id IN ({placeholders})
                 """,
-                [group_id, *message_ids],
+                [group_id, lease_token, *message_ids],
             ).fetchall()
-            cursor = conn.execute(
+            acked_ids = [row["message_id"] for row in rows]
+            if not acked_ids:
+                return []
+            acked_placeholders = ",".join("?" for _ in acked_ids)
+            conn.execute(
                 f"""
                 UPDATE unread_messages
-                SET delivered_at = datetime('now'), lease_until = NULL
-                WHERE group_id = ?
-                  AND delivered_at IS NULL
-                  AND message_id IN ({placeholders})
+                SET delivered_at = datetime('now'),
+                    lease_until = NULL,
+                    lease_token = NULL
+                WHERE message_id IN ({acked_placeholders})
+                  AND lease_token = ?
                 """,
-                [group_id, *message_ids],
+                [*acked_ids, lease_token],
             )
-            if cursor.rowcount <= 0:
-                return []
         return [
             {
                 "message_id": row["message_id"],
                 "external_message_id": row["external_message_id"],
             }
-            for row in rows
+            for row in sorted(rows, key=lambda item: item["message_id"])
         ]
 
     def cleanup(self, *, delivered_retention_days: int, processed_retention_days: int) -> dict:

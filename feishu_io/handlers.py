@@ -43,8 +43,7 @@ async def handle_incoming_message(
                 logger.exception("failed to send bind confirmation")
         return {"ok": True, "bound": alias, "changed": changed}
 
-    destination_group = store.resolve_chat_id(chat_id) or chat_id
-    if not store.add_message_once(message.for_group(destination_group)):
+    if not store.add_message_once(message):
         return {"ok": True, "duplicate": True}
     return {"ok": True}
 

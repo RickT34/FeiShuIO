@@ -75,11 +75,21 @@ class FeishuIO:
             json={"id": id, "limit": limit, "ack": ack},
         )
 
-    def ack_messages(self, id: str, message_ids: list[int]) -> dict[str, Any]:
+    def ack_messages(
+        self,
+        id: str,
+        message_ids: list[int],
+        *,
+        lease_token: str,
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             "/ack_messages",
-            json={"id": id, "message_ids": message_ids},
+            json={
+                "id": id,
+                "message_ids": message_ids,
+                "lease_token": lease_token,
+            },
         )
 
     def health(self) -> dict[str, Any]:
