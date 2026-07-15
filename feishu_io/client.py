@@ -5,6 +5,12 @@ from typing import Any
 
 import httpx
 
+from feishu_io.client_config import (
+    ClientConfig,
+    load_client_config,
+    normalize_server_url,
+)
+
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 
@@ -21,9 +27,20 @@ class FeishuIO:
         *,
         timeout: float = 10.0,
         transport: httpx.BaseTransport | None = None,
+        config_path: str | os.PathLike[str] | None = None,
     ) -> None:
-        self.base_url = (base_url or os.getenv("FEISHU_IO_URL") or DEFAULT_BASE_URL).rstrip("/")
-        self.api_key = api_key or os.getenv("FEISHU_IO_API_KEY")
+        environment_url = os.getenv("FEISHU_IO_URL")
+        environment_key = os.getenv("FEISHU_IO_API_KEY")
+        selected_url = (
+            base_url if base_url is not None else (environment_url or None)
+        )
+        stored = ClientConfig()
+        if selected_url is None or not (api_key or environment_key):
+            stored = load_client_config(config_path)
+        self.base_url = normalize_server_url(
+            selected_url if selected_url is not None else (stored.url or DEFAULT_BASE_URL)
+        )
+        self.api_key = api_key or environment_key or stored.api_key
         if not self.api_key:
             raise ValueError("api_key is required, or set FEISHU_IO_API_KEY")
         self.timeout = timeout
@@ -33,17 +50,25 @@ class FeishuIO:
         return {"X-API-Key": self.api_key or ""}
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        with httpx.Client(
-            base_url=self.base_url,
-            timeout=self.timeout,
-            transport=self.transport,
-        ) as client:
-            response = client.request(method, path, headers=self._headers(), **kwargs)
+        try:
+            with httpx.Client(
+                base_url=self.base_url,
+                timeout=self.timeout,
+                transport=self.transport,
+            ) as client:
+                response = client.request(method, path, headers=self._headers(), **kwargs)
+        except httpx.HTTPError as exc:
+            raise FeishuIOError(f"request to {self.base_url}{path} failed: {exc}") from exc
         if response.status_code >= 400:
             raise FeishuIOError(
                 f"{response.status_code} {response.reason_phrase}: {response.text}"
             )
-        return response.json()
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise FeishuIOError(
+                f"{response.status_code} response from {path} is not valid JSON"
+            ) from exc
 
     def send_markdown(self, text: str, id: str) -> dict[str, Any]:
         return self._request("POST", "/send_markdown", json={"id": id, "text": text})
@@ -93,30 +118,10 @@ class FeishuIO:
         )
 
     def health(self) -> dict[str, Any]:
-        with httpx.Client(
-            base_url=self.base_url,
-            timeout=self.timeout,
-            transport=self.transport,
-        ) as client:
-            response = client.get("/health")
-        if response.status_code >= 400:
-            raise FeishuIOError(
-                f"{response.status_code} {response.reason_phrase}: {response.text}"
-            )
-        return response.json()
+        return self._request("GET", "/health")
 
     def ready(self) -> dict[str, Any]:
-        with httpx.Client(
-            base_url=self.base_url,
-            timeout=self.timeout,
-            transport=self.transport,
-        ) as client:
-            response = client.get("/ready")
-        if response.status_code >= 400:
-            raise FeishuIOError(
-                f"{response.status_code} {response.reason_phrase}: {response.text}"
-            )
-        return response.json()
+        return self._request("GET", "/ready")
 
     def cleanup(self) -> dict[str, Any]:
         return self._request("POST", "/maintenance/cleanup")

@@ -1,6 +1,6 @@
 # FeiShuIO
 
-一个长期运行的极简 REST 服务，用飞书应用机器人把其他项目接入飞书群。
+一个 server/client 分离的极简飞书消息桥。Server 在服务器上常驻，负责飞书长连接、消息队列和 REST API；Client 只在需要发送或接收消息时启动，命令结束后退出。
 
 它支持飞书开放平台的长连接事件接收模式，服务器不需要公网 IP，只需要能主动访问飞书开放平台。
 
@@ -48,15 +48,57 @@ test -> 当前群 chat_id
 /bind exp.v1
 ```
 
-## 安装
+## 架构和使用方式
+
+- Server：只部署一份，持久连接飞书并保存 SQLite 消息队列。
+- Client：可安装在任意 agent 或任务机器上，只依赖 HTTP 客户端，不需要飞书 SDK、数据库或服务端配置。
+- 调用端只需要知道 Server URL、API key 和群 alias。
+
+API key 会随 HTTP 请求发送。跨机器部署时应使用 HTTPS 反向代理或可信内网，不要把明文 HTTP 直接暴露到公网。
+
+## Server 常驻部署
+
+Server 使用独立 Python 虚拟环境，不需要 Docker，也不需要手动激活环境。先准备配置：
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+cp .env.example .env
+# 编辑 .env，填入 API key 和飞书应用凭证
 ```
 
-## 配置
+Linux 服务器使用 systemd 用户服务常驻运行，只需执行：
+
+```bash
+./scripts/install-server-service.sh
+```
+
+安装脚本会自动创建 `.server-venv`、安装 Server 依赖、写入当前用户的 systemd service，并立即启动；安装服务本身不需要 root。为了保证服务器重启或用户退出登录后仍然运行，需要为该用户启用 linger：
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+日常管理：
+
+```bash
+systemctl --user status feishu-io.service
+systemctl --user restart feishu-io.service
+journalctl --user -u feishu-io.service -f
+curl http://127.0.0.1:8000/ready
+```
+
+没有 systemd 或只想前台运行时，使用同一个轻量启动器：
+
+```bash
+./scripts/run-server.sh
+```
+
+它会在首次运行时自动创建环境，后续直接启动。卸载常驻服务但保留配置和数据：
+
+```bash
+./scripts/uninstall-server-service.sh
+```
+
+## Server 配置
 
 ```bash
 cp .env.example .env
@@ -68,6 +110,9 @@ cp .env.example .env
 FEISHU_IO_API_KEY=change-this-api-key
 FEISHU_IO_DB=./data/feishu_io.sqlite3
 FEISHU_IO_ENABLE_WS=true
+FEISHU_IO_HOST=0.0.0.0
+FEISHU_IO_PORT=8000
+FEISHU_IO_LOG_LEVEL=info
 FEISHU_APP_ID=cli_xxxx
 FEISHU_APP_SECRET=xxxx
 FEISHU_EVENT_VERIFY_TOKEN=xxxx
@@ -97,17 +142,7 @@ FEISHU_PROCESSED_RETENTION_DAYS=30
 
 `FEISHU_DELIVERED_RETENTION_DAYS` 和 `FEISHU_PROCESSED_RETENTION_DAYS` 控制启动和手动清理时保留已投递消息、去重记录的天数。
 
-## 启动
-
-```bash
-uvicorn feishu_io.server:app --host 0.0.0.0 --port 8000
-```
-
-也可以使用入口命令：
-
-```bash
-feishu-io
-```
+`FEISHU_IO_HOST`、`FEISHU_IO_PORT` 和 `FEISHU_IO_LOG_LEVEL` 控制服务端监听地址、端口和日志级别。
 
 如果想把 REST 服务和飞书长连接监听拆成两个进程，可以这样：
 
@@ -132,16 +167,60 @@ X-API-Key: change-this-api-key
 Authorization: Bearer change-this-api-key
 ```
 
-## Python 和命令行工具
+## Client 单命令调用
 
-安装本项目后，会同时提供一个轻量 Python 客户端和命令行工具，避免手动构造请求体。
+在需要调用消息的机器上，只安装 client：
 
-Python 调用：
+```bash
+./scripts/install-client.sh
+```
+
+脚本把隔离环境安装到 `~/.local/share/feishu-io-client`，并创建 `~/.local/bin/feishu-ioctl`。也可以直接使用 `pipx install .` 或 `pip install .`；默认安装不包含任何 Server 依赖。
+
+首次配置一次 URL 和 key。用 stdin 可以避免 key 出现在 shell history 中：
+
+```bash
+printf '%s' 'change-this-api-key' | \
+  feishu-ioctl configure https://feishu-io.example.com --key-stdin
+feishu-ioctl ready
+```
+
+配置默认保存在 `~/.config/feishu-io/client.json`，权限为 `0600`。`FEISHU_IO_URL`、`FEISHU_IO_API_KEY` 或命令行 `--url`、`--key` 可以临时覆盖它；`FEISHU_IO_CONFIG` 可以指定另一份配置文件。
+
+发送消息只需要一条命令：
+
+```bash
+feishu-ioctl send test '**训练完成**'
+cat report.md | feishu-ioctl send test -
+```
+
+立即读取当前未读消息：
+
+```bash
+feishu-ioctl recv test
+```
+
+等待最多 60 秒，适合 agent 等待下一条指令：
+
+```bash
+feishu-ioctl recv test --wait 60
+```
+
+需要“处理成功后才删除”的无人值守任务，应使用租约模式：
+
+```bash
+feishu-ioctl recv test --wait 60 --no-ack
+feishu-ioctl ack test LEASE_TOKEN 1 2 3
+```
+
+所有命令输出 JSON，失败时返回非零退出码并把错误写到 stderr，便于 agent 或 shell 脚本判断。
+
+Python Client 使用相同配置文件，也可以显式传参：
 
 ```python
 from feishu_io import FeishuIO
 
-bot = FeishuIO("http://127.0.0.1:8000", api_key="change-this-api-key")
+bot = FeishuIO()  # 读取已保存的 client 配置
 bot.send_markdown("**训练完成**\n\n结果已写入 `runs/latest`。", "test")
 
 messages = bot.recv_unread("test")
@@ -149,36 +228,10 @@ for message in messages:
     print(message["text"])
 ```
 
-也可以用环境变量：
+或者显式传入：
 
-```bash
-export FEISHU_IO_URL=http://127.0.0.1:8000
-export FEISHU_IO_API_KEY=change-this-api-key
-```
-
-命令行发送：
-
-```bash
-feishu-ioctl send test '**训练完成**'
-```
-
-从 stdin 发送多行 Markdown：
-
-```bash
-cat report.md | feishu-ioctl send test -
-```
-
-读取未读消息：
-
-```bash
-feishu-ioctl recv test
-```
-
-可靠读取模式：
-
-```bash
-feishu-ioctl recv test --no-ack
-feishu-ioctl ack test LEASE_TOKEN 1 2 3
+```python
+bot = FeishuIO("https://feishu-io.example.com", api_key="change-this-api-key")
 ```
 
 `LEASE_TOKEN` 是 `recv --no-ack` 返回的消息中的 `lease_token`。它只对当前租约有效，租约过期或消息被重新租出后不能再确认。
@@ -269,7 +322,7 @@ curl -X POST http://127.0.0.1:8000/ack_messages \
 
 `GET /health` 是浅健康检查，只表示 HTTP 进程仍能响应。
 
-`GET /ready` 会检查 SQLite，并在启用内置长连接监听时检查飞书 WebSocket 是否真实连接；仅有重试线程存活不会被视为就绪。无人值守部署建议把 `/ready` 接到 systemd、Docker healthcheck 或外部监控。
+`GET /ready` 会检查 SQLite，并在启用内置长连接监听时检查飞书 WebSocket 是否真实连接；仅有重试线程存活不会被视为就绪。无人值守部署建议把 `/ready` 接到外部监控。
 
 可以手动清理历史数据：
 

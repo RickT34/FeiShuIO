@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
@@ -50,7 +52,7 @@ async def lifespan(app: FastAPI):
             stop_listener_thread()
 
 
-app = FastAPI(title="FeiShuIO", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="FeiShuIO", version="0.3.0", lifespan=lifespan)
 
 
 @lru_cache
@@ -274,7 +276,25 @@ async def feishu_events(
 
 
 def main() -> None:
-    uvicorn.run("feishu_io.server:app", host="0.0.0.0", port=8000, reload=False)
+    parser = argparse.ArgumentParser(
+        prog="feishu-io-server",
+        description="Run the persistent FeiShuIO REST and Feishu listener service.",
+    )
+    parser.add_argument("--host", default=os.getenv("FEISHU_IO_HOST", "0.0.0.0"))
+    parser.add_argument(
+        "--port", type=int, default=int(os.getenv("FEISHU_IO_PORT", "8000"))
+    )
+    parser.add_argument(
+        "--log-level", default=os.getenv("FEISHU_IO_LOG_LEVEL", "info")
+    )
+    args = parser.parse_args()
+    uvicorn.run(
+        "feishu_io.server:app",
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        reload=False,
+    )
 
 
 if __name__ == "__main__":
