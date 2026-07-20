@@ -55,8 +55,24 @@ def test_python_client_raises_for_http_error():
 
     client = FeishuIO("http://feishuio.local", "secret", transport=make_transport(handler))
 
-    with pytest.raises(FeishuIOError, match="404"):
+    with pytest.raises(FeishuIOError, match="^404: unknown id$"):
         client.recv_unread("missing")
+
+
+def test_python_client_keeps_structured_http_error_detail_compact():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={"detail": {"ok": False, "checks": {"listener": "offline"}}},
+        )
+
+    client = FeishuIO("http://feishuio.local", "secret", transport=make_transport(handler))
+
+    with pytest.raises(
+        FeishuIOError,
+        match=r'^503: \{"ok":false,"checks":\{"listener":"offline"\}\}$',
+    ):
+        client.ready()
 
 
 def test_python_client_ack_includes_lease_token():

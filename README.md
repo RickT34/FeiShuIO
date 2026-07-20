@@ -213,9 +213,9 @@ cat report.md | ./scripts/client.sh send test -
 ./scripts/client.sh ack test LEASE_TOKEN 1 2 3
 ```
 
-所有命令输出 JSON，失败时返回非零退出码并把错误写到 stderr，便于 agent 或 shell 脚本判断。为保证环境与数据边界一致，自动化调用统一使用 `scripts/client.sh`，不要直接调用内部的 `feishu-ioctl`。
+所有命令默认输出供 Agent 使用的单行精简 JSON，失败时返回非零退出码并把简洁错误写到 stderr。`recv` 只保留消息编号、发送者、正文、时间；租约令牌提升到响应顶层，避免每条消息重复输出。需要排障或读取服务端完整响应时，在子命令前加 `--full`，例如 `./scripts/client.sh --full ready`。为保证环境与数据边界一致，自动化调用统一使用 `scripts/client.sh`，不要直接调用内部的 `feishu-ioctl`。
 
-`LEASE_TOKEN` 是 `recv --no-ack` 返回的消息中的 `lease_token`。它只对当前租约有效，租约过期或消息被重新租出后不能再确认。
+`LEASE_TOKEN` 是 `recv --no-ack` 返回的顶层 `lease_token`。它只对当前租约有效，租约过期或消息被重新租出后不能再确认。
 
 健康检查：
 

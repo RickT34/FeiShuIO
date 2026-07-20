@@ -16,7 +16,48 @@ from feishu_io.client_config import (
 
 
 def _print_json(data: Any) -> None:
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+    print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+
+def _compact_messages(data: dict[str, Any]) -> dict[str, Any]:
+    messages = []
+    lease_tokens: set[str] = set()
+    for message in data.get("messages") or []:
+        compact = {
+            key: message[key]
+            for key in ("message_id", "sender_name", "text", "created_at")
+            if message.get(key) is not None
+        }
+        if message.get("message_type") not in (None, "text"):
+            compact["message_type"] = message["message_type"]
+        if message.get("lease_token"):
+            lease_tokens.add(message["lease_token"])
+        messages.append(compact)
+
+    result: dict[str, Any] = {"messages": messages}
+    if len(lease_tokens) == 1:
+        result["lease_token"] = lease_tokens.pop()
+    return result
+
+
+def _compact_response(command: str, data: dict[str, Any]) -> dict[str, Any]:
+    if command == "recv":
+        return _compact_messages(data)
+    if command == "ack":
+        return {"acked": data.get("acked", 0)}
+    if command == "cleanup":
+        return {
+            key: value
+            for key, value in data.items()
+            if key.endswith("_deleted")
+        }
+    if command in {"send", "health", "ready"}:
+        return {"ok": bool(data.get("ok"))}
+    return data
+
+
+def _print_response(command: str, data: dict[str, Any], *, full: bool) -> None:
+    _print_json(data if full else _compact_response(command, data))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Print the complete server response instead of the compact Agent view.",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -178,23 +224,25 @@ def main(argv: list[str] | None = None) -> int:
             text = args.text
             if text is None or text == "-":
                 text = sys.stdin.read()
-            _print_json(client.send_markdown(text, args.id))
+            _print_response("send", client.send_markdown(text, args.id), full=args.full)
         elif args.command == "recv":
-            _print_json(_recv_with_wait(client, args))
+            _print_response("recv", _recv_with_wait(client, args), full=args.full)
         elif args.command == "ack":
-            _print_json(
+            _print_response(
+                "ack",
                 client.ack_messages(
                     args.id,
                     args.message_ids,
                     lease_token=args.lease_token,
-                )
+                ),
+                full=args.full,
             )
         elif args.command == "health":
-            _print_json(client.health())
+            _print_response("health", client.health(), full=args.full)
         elif args.command == "ready":
-            _print_json(client.ready())
+            _print_response("ready", client.ready(), full=args.full)
         elif args.command == "cleanup":
-            _print_json(client.cleanup())
+            _print_response("cleanup", client.cleanup(), full=args.full)
         else:
             parser.error(f"unknown command: {args.command}")
     except (FeishuIOError, ValueError) as exc:

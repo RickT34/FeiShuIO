@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from feishu_io import cli
 
 
@@ -36,7 +38,11 @@ class FakeClient:
         return {"ok": True, "checks": {}}
 
     def cleanup(self):
-        return {"ok": True}
+        return {
+            "ok": True,
+            "delivered_messages_deleted": 2,
+            "processed_messages_deleted": 1,
+        }
 
 
 def test_cli_send_reads_text_argument(monkeypatch, capsys):
@@ -47,7 +53,8 @@ def test_cli_send_reads_text_argument(monkeypatch, capsys):
 
     assert exit_code == 0
     assert FakeClient.calls == [("send", "test", "**hi**")]
-    assert json.loads(capsys.readouterr().out)["ok"] is True
+    output = capsys.readouterr().out
+    assert output == '{"ok":true}\n'
 
 
 def test_cli_recv_no_ack(monkeypatch, capsys):
@@ -61,6 +68,114 @@ def test_cli_recv_no_ack(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["messages"] == []
 
 
+def test_cli_recv_prints_only_agent_fields_and_hoists_lease_token(
+    monkeypatch, capsys
+):
+    FakeClient.calls = []
+    FakeClient.recv_responses = [
+        {
+            "ok": True,
+            "id": "test",
+            "ack_required": True,
+            "messages": [
+                {
+                    "message_id": 7,
+                    "external_message_id": "om_internal",
+                    "id": "test",
+                    "sender_id": "ou_internal",
+                    "sender_name": "Rick",
+                    "message_type": "text",
+                    "text": "continue",
+                    "raw": {"large": "payload"},
+                    "created_at": "2026-07-20 10:00:00",
+                    "lease_token": "a" * 32,
+                }
+            ],
+        }
+    ]
+    monkeypatch.setattr(cli, "FeishuIO", FakeClient)
+
+    exit_code = cli.main(["--key", "k", "recv", "test", "--no-ack"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "messages": [
+            {
+                "message_id": 7,
+                "sender_name": "Rick",
+                "text": "continue",
+                "created_at": "2026-07-20 10:00:00",
+            }
+        ],
+        "lease_token": "a" * 32,
+    }
+
+
+def test_cli_full_preserves_complete_server_response(monkeypatch, capsys):
+    FakeClient.calls = []
+    FakeClient.recv_responses = [
+        {
+            "ok": True,
+            "id": "test",
+            "messages": [{"message_id": 1, "raw": {"event": "complete"}}],
+            "ack_required": False,
+        }
+    ]
+    monkeypatch.setattr(cli, "FeishuIO", FakeClient)
+
+    exit_code = cli.main(["--key", "k", "--full", "recv", "test"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": True,
+        "id": "test",
+        "messages": [{"message_id": 1, "raw": {"event": "complete"}}],
+        "ack_required": False,
+    }
+
+
+def test_cli_recv_keeps_non_text_type(monkeypatch, capsys):
+    FakeClient.recv_responses = [
+        {
+            "messages": [
+                {
+                    "message_id": 8,
+                    "message_type": "image",
+                    "text": "[image]",
+                }
+            ]
+        }
+    ]
+    monkeypatch.setattr(cli, "FeishuIO", FakeClient)
+
+    assert cli.main(["--key", "k", "recv", "test"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "messages": [
+            {"message_id": 8, "text": "[image]", "message_type": "image"}
+        ]
+    }
+
+
+@pytest.mark.parametrize("command", ["health", "ready"])
+def test_cli_compacts_service_status(command, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "FeishuIO", FakeClient)
+
+    assert cli.main(["--key", "k", command]) == 0
+
+    assert capsys.readouterr().out == '{"ok":true}\n'
+
+
+def test_cli_cleanup_keeps_only_deleted_counts(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "FeishuIO", FakeClient)
+
+    assert cli.main(["--key", "k", "cleanup"]) == 0
+
+    assert capsys.readouterr().out == (
+        '{"delivered_messages_deleted":2,"processed_messages_deleted":1}\n'
+    )
+
+
 def test_cli_ack(monkeypatch, capsys):
     FakeClient.calls = []
     monkeypatch.setattr(cli, "FeishuIO", FakeClient)
@@ -72,7 +187,7 @@ def test_cli_ack(monkeypatch, capsys):
 
     assert exit_code == 0
     assert FakeClient.calls == [("ack", "test", [1, 2], lease_token)]
-    assert json.loads(capsys.readouterr().out)["acked"] == 2
+    assert capsys.readouterr().out == '{"acked":2}\n'
 
 
 def test_cli_configure_then_uses_saved_config(tmp_path, monkeypatch, capsys):

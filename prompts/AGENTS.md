@@ -73,7 +73,7 @@ EOF
 
 1. 如果返回的 `messages` 为空，并且当前 goal 或任务仍在运行，则继续以 60 秒（可灵活延长时间）为一个周期等待，同时遵守运行环境的状态更新要求。
 2. 如果收到多条消息，按 `message_id` 顺序阅读，并结合当前任务上下文解释；较新的明确指示覆盖较早的冲突指示。
-3. 先记录并理解指示，再使用返回消息中的 `lease_token` 和 `message_id` 确认消息：
+3. 先记录并理解指示，再使用响应顶层的 `lease_token` 和各消息的 `message_id` 确认消息：
 
 ```bash
 "$FEISHU_IO_CLIENT" ack "$FEISHU_AGENT_ID" LEASE_TOKEN MESSAGE_ID...

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -60,9 +61,16 @@ class FeishuIO:
         except httpx.HTTPError as exc:
             raise FeishuIOError(f"request to {self.base_url}{path} failed: {exc}") from exc
         if response.status_code >= 400:
-            raise FeishuIOError(
-                f"{response.status_code} {response.reason_phrase}: {response.text}"
-            )
+            detail: Any = response.text.strip()
+            try:
+                payload = response.json()
+                if isinstance(payload, dict) and "detail" in payload:
+                    detail = payload["detail"]
+            except ValueError:
+                pass
+            if not isinstance(detail, str):
+                detail = json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
+            raise FeishuIOError(f"{response.status_code}: {detail}")
         try:
             return response.json()
         except ValueError as exc:
