@@ -17,4 +17,4 @@ esac
 
 cwd="$(printf '%s' "$payload" | jq -r '.cwd // ""')"
 
-"$FEISHU_IO_CLIENT" send "$FEISHU_AGENT_ID" "**$title** in $cwd"
+"$FEISHU_IO_CLIENT" send "$FEISHU_AGENT_ID" "**$title** in $cwd" >/dev/null
