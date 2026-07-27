@@ -1,10 +1,51 @@
 # FeiShuIO
 
-一个 server/client 分离的极简飞书消息桥。Server 在服务器上常驻，负责飞书长连接、消息队列和 REST API；Client 只在需要发送或接收消息时启动，命令结束后退出。
+一个面向自主运行 Agent 的极简飞书消息桥。它让运行在服务器、工作站或容器中的 Agent 能够通过命令行向飞书汇报状态，并在真正需要人工决策时可靠地接收指示。
 
-它支持飞书开放平台的长连接事件接收模式，服务器不需要公网 IP，只需要能主动访问飞书开放平台。
+我目前主要用它观察长时间自主运行的 Agent：Agent 在关键阶段主动发送进度，遇到阻塞时报告上下文并等待指示，完成或失败后发送最终结果。这样不需要一直守着终端，也不需要给每台 Agent 机器安装飞书 SDK 或暴露公网端口。
 
-业务接口只保留两个：
+## 典型使用场景
+
+### 自主运行 Agent 状态汇报
+
+这是 FeiShuIO 的主要使用场景：
+
+- **过程可见**：训练、评测、部署或代码修改进入关键阶段时，Agent 主动发送简洁状态。
+- **阻塞求助**：缺少凭证、需要业务选择或继续执行存在风险时，Agent 把已完成工作、阻塞原因和建议发送到飞书。
+- **远程指示**：用户直接在飞书群回复，Agent 使用可靠的租约模式读取，理解并确认指示后继续执行。
+- **结果通知**：任务完成或失败时，自动发送结果、验证情况和产物位置。
+
+例如，Agent 可以直接执行：
+
+```bash
+# 汇报当前进度
+./scripts/client.sh send gpu-a '**状态更新**：训练已完成 3/5 个阶段，指标正常。'
+
+# 遇到真正的阻塞时等待指示；消息不会在处理成功前丢失
+./scripts/client.sh recv gpu-a --wait 60 --no-ack
+./scripts/client.sh ack gpu-a LEASE_TOKEN 1 2 3
+
+# 汇报最终结果
+cat run-summary.md | ./scripts/client.sh send gpu-a -
+```
+
+仓库提供了可复用的 [`prompts/AGENTS.md`](prompts/AGENTS.md)，用于约束 Codex 等 Agent 在自主执行期间何时汇报、何时等待以及如何可靠确认消息。跨服务器接入方法见 [`prompts/README.md`](prompts/README.md)。
+
+### 其他长任务与自动化
+
+FeiShuIO 也适用于无人值守脚本、定时任务、数据处理流水线和服务巡检。调用端只需运行一个命令，就能发送 Markdown 报告或读取飞书中的控制消息；默认输出为精简的单行 JSON，便于 Shell 脚本和 Agent 解析。
+
+## 工作方式
+
+FeiShuIO 采用 server/client 分离：
+
+- **Server** 在一台服务器上常驻，维护飞书长连接、SQLite 消息队列和 REST API。
+- **Client** 放在各个 Agent 或任务机器上，只在发送或接收消息时启动，命令结束后退出。
+- **飞书群** 既是状态面板，也是需要人工介入时的控制入口。
+
+Server 使用飞书开放平台的长连接事件接收模式，不需要公网 IP，只需要能主动访问飞书开放平台。Agent 机器也不需要飞书应用凭证，只需知道 Server URL、API key 和群 alias。
+
+核心消息接口是：
 
 - `send_markdown(text, id)`：向 `id` 绑定的飞书群发送 Markdown。
 - `recv_unread(id)`：取出 `id` 绑定群的未读消息，返回后即标记为已读。
@@ -48,7 +89,7 @@ test -> 当前群 chat_id
 /bind exp.v1
 ```
 
-## 架构和使用方式
+## 部署结构
 
 - Server：只部署一份，持久连接飞书并保存 SQLite 消息队列。
 - Client：可安装在任意 agent 或任务机器上，只依赖 HTTP 客户端，不需要飞书 SDK、数据库或服务端配置。
@@ -325,11 +366,16 @@ curl -X POST http://127.0.0.1:8000/maintenance/cleanup \
 
 项目仍保留 `POST /feishu/events` 作为兼容入口；如果以后你有公网域名，也可以切回传统 HTTP 回调。该入口只在配置了 `FEISHU_EVENT_VERIFY_TOKEN` 时启用，并由飞书 SDK 统一完成 token、签名和加密载荷校验。没有公网 IP 时，只需要长连接模式。
 
-## Hook配置
+## Codex goal 自动通知
 
-如果想当goal完成或失败时，自动发送消息，按照以下格式配置即可（需要设置环境变量，参考`prompts/AGENTS.md`）。
+Agent 可以在执行过程中直接调用 `send` 汇报状态。对于使用 Codex goal 的任务，还可以在 goal 进入 `complete` 或 `blocked` 状态时，通过仓库中的 `scripts/codex_goal_hook.sh` 自动发送一条终态通知。
 
-`~/.codex/hooks.json`：
+先确保启动 Codex 的环境已经设置 `FEISHU_AGENT_ID` 和 `FEISHU_IO_CLIENT`，具体配置见 [`prompts/README.md`](prompts/README.md)。然后添加以下 Hook：
+
+```text
+~/.codex/hooks.json
+```
+
 ```json
 {
   "hooks": {
@@ -349,3 +395,5 @@ curl -X POST http://127.0.0.1:8000/maintenance/cleanup \
   }
 }
 ```
+
+将 `/PATH/TO/FeiShuIO` 替换为本机仓库的绝对路径。这个 Hook 只负责 goal 完成或阻塞时的简短自动通知；阶段性进度、详细结果和等待用户指示的流程仍应由 Agent 按 [`prompts/AGENTS.md`](prompts/AGENTS.md) 调用 Client 完成。
