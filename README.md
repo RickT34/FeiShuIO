@@ -324,3 +324,28 @@ curl -X POST http://127.0.0.1:8000/maintenance/cleanup \
 如果某个群还没有绑定，消息会按原始 `chat_id` 暂存；之后完成绑定或更换 alias，不会丢失已经排队的消息。
 
 项目仍保留 `POST /feishu/events` 作为兼容入口；如果以后你有公网域名，也可以切回传统 HTTP 回调。该入口只在配置了 `FEISHU_EVENT_VERIFY_TOKEN` 时启用，并由飞书 SDK 统一完成 token、签名和加密载荷校验。没有公网 IP 时，只需要长连接模式。
+
+## Hook配置
+
+如果想当goal完成或失败时，自动发送消息，按照以下格式配置即可（需要设置环境变量，参考`prompts/AGENTS.md`）。
+
+`~/.codex/hooks.json`：
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^update_goal$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/PATH/TO/FeiShuIO/scripts/codex_goal_hook.sh",
+            "timeout": 60,
+            "statusMessage": "Sending goal notification"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
