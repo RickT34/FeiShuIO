@@ -98,12 +98,42 @@ def test_event_bind_allows_same_alias_on_multiple_conversations(tmp_path):
 
     assert store.bind_destination_once(
         external_message_id="bind-1", destination=first, alias="ops"
-    ) == (True, True)
+    ) == (True, True, 1)
     assert store.bind_destination_once(
         external_message_id="bind-2", destination=second, alias="ops"
-    ) == (True, True)
+    ) == (True, True, 2)
 
     assert store.resolve_targets("ops") == [first, second]
+
+
+def test_binding_queries_return_current_alias_and_aggregate_counts(tmp_path):
+    store = MessageStore(str(tmp_path / "messages.db"))
+    first = Destination("feishu", "default", "chat-1")
+    second = Destination("slack", "workspace", "channel-1")
+    third = Destination("feishu", "default", "chat-2")
+    store.bind_destination(alias="ops", destination=first)
+    store.bind_destination(alias="ops", destination=second)
+    store.bind_destination(alias="alerts", destination=third)
+
+    assert store.destination_alias(first) == "ops"
+    assert store.destination_alias(Destination("feishu", "default", "missing")) is None
+    assert store.list_bindings() == [("alerts", 1), ("ops", 2)]
+
+
+def test_unbind_removes_only_current_destination_and_is_event_idempotent(tmp_path):
+    store = MessageStore(str(tmp_path / "messages.db"))
+    first = Destination("feishu", "default", "chat-1")
+    second = Destination("feishu", "default", "chat-2")
+    store.bind_destination(alias="ops", destination=first)
+    store.bind_destination(alias="ops", destination=second)
+
+    assert store.unbind_destination_once(
+        external_message_id="unbind-1", destination=first
+    ) == (True, "ops", 1)
+    assert store.unbind_destination_once(
+        external_message_id="unbind-1", destination=first
+    ) == (False, None, 0)
+    assert store.resolve_targets("ops") == [second]
 
 
 def test_receive_merges_same_alias_in_global_order_with_aggregate_limit(tmp_path):

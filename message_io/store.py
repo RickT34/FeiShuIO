@@ -114,24 +114,24 @@ class MessageStore:
         external_message_id: str | None,
         destination: Destination,
         alias: str,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, int]:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if not self._mark_processed(conn, destination, external_message_id):
-                return False, False
+                return False, False, 0
             destination_id = self._ensure_destination(conn, destination)
             row = conn.execute(
                 "SELECT alias FROM destinations WHERE destination_id = ?",
                 (destination_id,),
             ).fetchone()
             if row and row["alias"] == alias:
-                return True, False
+                return True, False, self._alias_count(conn, alias)
             conn.execute(
                 "UPDATE destinations SET alias = ?, updated_at = datetime('now') "
                 "WHERE destination_id = ?",
                 (alias, destination_id),
             )
-            return True, True
+            return True, True, self._alias_count(conn, alias)
 
     def bind_destination(self, *, alias: str, destination: Destination) -> bool:
         with self.connect() as conn:
@@ -165,6 +165,70 @@ class MessageStore:
             )
             for row in rows
         ]
+
+    def destination_alias(self, destination: Destination) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT alias FROM destinations WHERE platform = ? "
+                "AND account_id = ? AND conversation_id = ?",
+                (
+                    destination.platform,
+                    destination.account_id,
+                    destination.conversation_id,
+                ),
+            ).fetchone()
+        if row is None or row["alias"] is None:
+            return None
+        return str(row["alias"])
+
+    def list_bindings(self) -> list[tuple[str, int]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT alias, COUNT(*) AS destination_count FROM destinations "
+                "WHERE alias IS NOT NULL GROUP BY alias ORDER BY alias ASC"
+            ).fetchall()
+        return [
+            (str(row["alias"]), int(row["destination_count"])) for row in rows
+        ]
+
+    def mark_processed_once(
+        self,
+        *,
+        external_message_id: str | None,
+        destination: Destination,
+    ) -> bool:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return self._mark_processed(conn, destination, external_message_id)
+
+    def unbind_destination_once(
+        self,
+        *,
+        external_message_id: str | None,
+        destination: Destination,
+    ) -> tuple[bool, str | None, int]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._mark_processed(conn, destination, external_message_id):
+                return False, None, 0
+            row = conn.execute(
+                "SELECT destination_id, alias FROM destinations WHERE platform = ? "
+                "AND account_id = ? AND conversation_id = ?",
+                (
+                    destination.platform,
+                    destination.account_id,
+                    destination.conversation_id,
+                ),
+            ).fetchone()
+            if row is None or row["alias"] is None:
+                return True, None, 0
+            alias = str(row["alias"])
+            conn.execute(
+                "UPDATE destinations SET alias = NULL, updated_at = datetime('now') "
+                "WHERE destination_id = ?",
+                (int(row["destination_id"]),),
+            )
+            return True, alias, self._alias_count(conn, alias)
 
     def add_message_once(self, message: IncomingMessage) -> bool:
         with self.connect() as conn:
@@ -374,6 +438,14 @@ class MessageStore:
             (destination.platform, destination.account_id, external_message_id),
         )
         return cursor.rowcount > 0
+
+    @staticmethod
+    def _alias_count(conn: sqlite3.Connection, alias: str) -> int:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM destinations WHERE alias = ?", (alias,)
+            ).fetchone()[0]
+        )
 
     @staticmethod
     def _destination_ids_for_alias(
