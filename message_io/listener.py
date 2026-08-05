@@ -11,23 +11,24 @@ import lark_oapi as lark
 import lark_oapi.ws.client as lark_ws_client
 from lark_oapi.core.json import JSON
 
-from feishu_io.config import Settings, get_settings
-from feishu_io.events import extract_text_message
-from feishu_io.feishu import FeishuAppClient
-from feishu_io.handlers import handle_incoming_message_sync
-from feishu_io.store import MessageStore
+from message_io.config import Settings, get_settings
+from message_io.handlers import handle_incoming_message_sync
+from message_io.platforms.feishu import FeishuAdapter, extract_message
+from message_io.store import MessageStore
 
 logger = logging.getLogger(__name__)
 
 
-def handle_lark_message_event(event, *, store: MessageStore, client: FeishuAppClient) -> None:
+def handle_lark_message_event(
+    event, *, store: MessageStore, adapter: FeishuAdapter
+) -> None:
     try:
         payload = JSON.unmarshal(JSON.marshal(event), dict)
-        message = extract_text_message(payload)
+        message = extract_message(payload, account_id=adapter.account_id)
         if not message:
             logger.warning("received unsupported Feishu message event")
             return
-        handle_incoming_message_sync(message=message, store=store, client=client)
+        handle_incoming_message_sync(message=message, store=store, adapter=adapter)
     except Exception:
         logger.exception("failed to process Feishu message event")
         raise
@@ -37,10 +38,10 @@ def build_event_handler(
     *,
     settings: Settings,
     store: MessageStore,
-    client: FeishuAppClient,
+    adapter: FeishuAdapter,
 ):
     def on_message(event) -> None:
-        handle_lark_message_event(event, store=store, client=client)
+        handle_lark_message_event(event, store=store, adapter=adapter)
 
     return (
         lark.EventDispatcherHandler.builder(
@@ -129,8 +130,12 @@ class ListenerService:
         self,
         *,
         settings_factory: Callable[[], Settings] = get_settings,
+        store: MessageStore | None = None,
+        adapter: FeishuAdapter | None = None,
     ) -> None:
         self._settings_factory = settings_factory
+        self._store = store
+        self._adapter = adapter
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -221,14 +226,24 @@ class ListenerService:
 
     def _run_once(self, settings: Settings | None = None) -> None:
         settings = settings or self._settings_factory()
-        store = MessageStore(settings.db_path)
-        client = FeishuAppClient(
+        if not settings.feishu_enabled:
+            raise RuntimeError("Feishu listener cannot start while FEISHU_ENABLED=false")
+        if not settings.feishu_app_id or not settings.feishu_app_secret:
+            raise RuntimeError("enabled Feishu adapter has no credentials")
+        store = self._store or MessageStore(settings.db_path)
+        adapter = self._adapter or FeishuAdapter(
+            account_id=settings.feishu_account_id,
             app_id=settings.feishu_app_id,
             app_secret=settings.feishu_app_secret,
+            reaction_emoji=(
+                settings.feishu_read_reaction_emoji
+                if settings.feishu_mark_delivered_reaction
+                else None
+            ),
             retry_attempts=settings.feishu_retry_attempts,
             retry_base_delay=settings.feishu_retry_base_delay,
         )
-        handler = build_event_handler(settings=settings, store=store, client=client)
+        handler = build_event_handler(settings=settings, store=store, adapter=adapter)
         self._ws_client = ManagedWsClient(
             settings.feishu_app_id,
             settings.feishu_app_secret,

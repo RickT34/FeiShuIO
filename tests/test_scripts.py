@@ -30,10 +30,10 @@ def test_client_script_keeps_environment_and_config_in_project(tmp_path):
     _write_executable(venv_bin / "python", "#!/bin/sh\nexit 0\n")
     invocation_log = tmp_path / "client-invocation.log"
     _write_executable(
-        venv_bin / "feishu-ioctl",
+        venv_bin / "message-ioctl",
         (
             "#!/bin/sh\n"
-            'printf "%s\\n" "$FEISHU_IO_CONFIG" >"$CLIENT_INVOCATION_LOG"\n'
+            'printf "%s\\n" "$MESSAGE_IO_CONFIG" >"$CLIENT_INVOCATION_LOG"\n'
             'printf "%s\\n" "$XDG_CACHE_HOME" >>"$CLIENT_INVOCATION_LOG"\n'
             'printf "%s\\n" "$PIP_CACHE_DIR" >>"$CLIENT_INVOCATION_LOG"\n'
             'printf "%s\\n" "$*" >>"$CLIENT_INVOCATION_LOG"\n'
@@ -41,7 +41,7 @@ def test_client_script_keeps_environment_and_config_in_project(tmp_path):
     )
     environment = os.environ.copy()
     environment["CLIENT_INVOCATION_LOG"] = str(invocation_log)
-    environment["FEISHU_IO_CONFIG"] = str(tmp_path / "outside.json")
+    environment["MESSAGE_IO_CONFIG"] = str(tmp_path / "outside.json")
 
     result = subprocess.run(
         [str(client_script), "send", "test", "hello"],
@@ -103,7 +103,7 @@ def test_systemd_installer_writes_and_enables_user_service(tmp_path):
     )
     _write_executable(project / "scripts" / "run-server.sh", "#!/bin/sh\nexit 0\n")
     env_file = project / ".env"
-    env_file.write_text("FEISHU_IO_API_KEY=test\n", encoding="utf-8")
+    env_file.write_text("MESSAGE_IO_API_KEY=test\n", encoding="utf-8")
 
     fake_bin = tmp_path / "bin"
     systemctl_log = tmp_path / "systemctl.log"
@@ -131,7 +131,7 @@ def test_systemd_installer_writes_and_enables_user_service(tmp_path):
         check=False,
     )
 
-    unit_file = config_home / "systemd" / "user" / "feishu-io.service"
+    unit_file = config_home / "systemd" / "user" / "message-io.service"
     unit = unit_file.read_text(encoding="utf-8")
     assert result.returncode == 0
     assert f'WorkingDirectory="{project}"' in unit
@@ -143,7 +143,7 @@ def test_systemd_installer_writes_and_enables_user_service(tmp_path):
     assert systemctl_log.read_text(encoding="utf-8").splitlines() == [
         "--user show-environment",
         "--user daemon-reload",
-        "--user enable --now feishu-io.service",
+        "--user enable --now message-io.service",
     ]
 
 
@@ -155,7 +155,7 @@ def test_systemd_uninstaller_disables_service_but_keeps_project_data(tmp_path):
         uninstaller,
     )
     config_home = tmp_path / "config"
-    unit_file = config_home / "systemd" / "user" / "feishu-io.service"
+    unit_file = config_home / "systemd" / "user" / "message-io.service"
     unit_file.parent.mkdir(parents=True)
     unit_file.write_text("[Service]\n", encoding="utf-8")
     env_file = project / ".env"
@@ -193,9 +193,9 @@ def test_systemd_uninstaller_disables_service_but_keeps_project_data(tmp_path):
     assert env_file.exists()
     assert data_file.exists()
     assert systemctl_log.read_text(encoding="utf-8").splitlines() == [
-        "--user disable --now feishu-io.service",
+        "--user disable --now message-io.service",
         "--user daemon-reload",
-        "--user reset-failed feishu-io.service",
+        "--user reset-failed message-io.service",
     ]
 
 
@@ -206,7 +206,7 @@ def test_systemd_installer_stops_when_user_manager_is_unavailable(tmp_path):
         PROJECT_ROOT / "scripts" / "install-server-service.sh",
         installer,
     )
-    (project / ".env").write_text("FEISHU_IO_API_KEY=test\n", encoding="utf-8")
+    (project / ".env").write_text("MESSAGE_IO_API_KEY=test\n", encoding="utf-8")
     fake_bin = tmp_path / "bin"
     _write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 1\n")
     environment = os.environ.copy()

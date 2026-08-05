@@ -3,43 +3,38 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Protocol
-
-from feishu_io.events import IncomingMessage, parse_bind_command
-from feishu_io.feishu import FeishuAppError
-from feishu_io.store import MessageStore
+from message_io.domain import IncomingMessage, MessageContent
+from message_io.events import parse_bind_command
+from message_io.platforms.base import PlatformAdapter, PlatformError
+from message_io.store import MessageStore
 
 logger = logging.getLogger(__name__)
-
-
-class MarkdownSender(Protocol):
-    async def send_markdown(self, *, chat_id: str, text: str) -> dict:
-        ...
 
 
 async def handle_incoming_message(
     *,
     message: IncomingMessage,
     store: MessageStore,
-    client: MarkdownSender | None = None,
+    adapter: PlatformAdapter | None = None,
 ) -> dict:
-    chat_id = message.group_id
-    alias = parse_bind_command(message.text)
+    alias = parse_bind_command(message.content.text)
     if alias:
-        processed, changed = store.bind_group_once(
+        processed, changed = store.bind_destination_once(
             external_message_id=message.external_message_id,
+            destination=message.destination,
             alias=alias,
-            chat_id=chat_id,
         )
         if not processed:
             return {"ok": True, "duplicate": True}
-        if changed and client:
+        if changed and adapter:
             try:
-                await client.send_markdown(
-                    chat_id=chat_id,
-                    text=f"已绑定当前群为 `{alias}`。",
+                await adapter.send(
+                    destination=message.destination,
+                    content=MessageContent(
+                        type="markdown", text=f"已绑定当前会话为 `{alias}`。"
+                    ),
                 )
-            except FeishuAppError:
+            except PlatformError:
                 logger.exception("failed to send bind confirmation")
         return {"ok": True, "bound": alias, "changed": changed}
 
@@ -52,13 +47,13 @@ def handle_incoming_message_sync(
     *,
     message: IncomingMessage,
     store: MessageStore,
-    client: MarkdownSender | None = None,
+    adapter: PlatformAdapter | None = None,
 ) -> dict:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(
-            handle_incoming_message(message=message, store=store, client=client)
+            handle_incoming_message(message=message, store=store, adapter=adapter)
         )
 
     result: dict | None = None
@@ -68,12 +63,12 @@ def handle_incoming_message_sync(
         nonlocal result, error
         try:
             result = asyncio.run(
-                handle_incoming_message(message=message, store=store, client=client)
+                handle_incoming_message(message=message, store=store, adapter=adapter)
             )
         except BaseException as exc:
             error = exc
 
-    thread = threading.Thread(target=run_in_thread, name="feishu-message-handler")
+    thread = threading.Thread(target=run_in_thread, name="platform-message-handler")
     thread.start()
     thread.join()
     if error:

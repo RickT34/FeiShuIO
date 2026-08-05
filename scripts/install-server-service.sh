@@ -3,7 +3,7 @@ set -eu
 
 PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 UNIT_DIR=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
-UNIT_FILE="$UNIT_DIR/feishu-io.service"
+UNIT_FILE="$UNIT_DIR/message-io.service"
 TEMP_FILE="$UNIT_FILE.tmp.$$"
 SERVICE_USER=${USER:-}
 if [ -z "$SERVICE_USER" ]; then
@@ -25,13 +25,13 @@ if ! systemctl --user show-environment >/dev/null 2>&1; then
 fi
 
 chmod 600 "$PROJECT_ROOT/.env"
-FEISHU_IO_FORCE_INSTALL=1 "$PROJECT_ROOT/scripts/run-server.sh" --help >/dev/null
+MESSAGE_IO_FORCE_INSTALL=1 "$PROJECT_ROOT/scripts/run-server.sh" --help >/dev/null
 
 mkdir -p "$UNIT_DIR"
 trap 'rm -f "$TEMP_FILE"' EXIT HUP INT TERM
 cat >"$TEMP_FILE" <<EOF
 [Unit]
-Description=FeiShuIO persistent message bridge
+Description=MessageIO persistent message bridge
 
 [Service]
 Type=simple
@@ -52,10 +52,10 @@ mv "$TEMP_FILE" "$UNIT_FILE"
 trap - EXIT HUP INT TERM
 
 systemctl --user daemon-reload
-systemctl --user enable --now feishu-io.service
+systemctl --user enable --now message-io.service
 
-echo "FeiShuIO server service installed and started."
-echo "Status: systemctl --user status feishu-io.service"
-echo "Logs:   journalctl --user -u feishu-io.service -f"
+echo "MessageIO server service installed and started."
+echo "Status: systemctl --user status message-io.service"
+echo "Logs:   journalctl --user -u message-io.service -f"
 echo "For startup without an active login session, run once:"
 echo "  sudo loginctl enable-linger $SERVICE_USER"

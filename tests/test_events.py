@@ -1,4 +1,4 @@
-from feishu_io.events import parse_bind_command
+from message_io.events import parse_bind_command
 
 
 def test_parse_bind_command_accepts_simple_alias():

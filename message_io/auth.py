@@ -4,7 +4,7 @@ import hmac
 
 from fastapi import Depends, Header, HTTPException, status
 
-from feishu_io.config import Settings, get_settings
+from message_io.config import Settings, get_settings
 
 
 def require_api_key(

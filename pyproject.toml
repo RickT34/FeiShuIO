@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "feishu-io"
-version = "0.3.0"
-description = "Minimal REST bridge for Feishu group markdown sending and unread message polling."
+name = "message-io"
+version = "1.0.0"
+description = "Platform-neutral REST bridge for sending and receiving messages."
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27",
@@ -28,10 +28,10 @@ test = [
 ]
 
 [project.scripts]
-feishu-io = "feishu_io.server_cli:main"
-feishu-io-server = "feishu_io.server_cli:main"
-feishu-io-listener = "feishu_io.server_cli:listener_main"
-feishu-ioctl = "feishu_io.cli:main"
+message-io = "message_io.server_cli:main"
+message-io-server = "message_io.server_cli:main"
+message-io-listener = "message_io.server_cli:listener_main"
+message-ioctl = "message_io.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["feishu_io*"]
+include = ["message_io*"]

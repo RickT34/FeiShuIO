@@ -22,16 +22,16 @@ done
 
 mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
 chmod 700 "$CONFIG_DIR" "$CACHE_DIR"
-export FEISHU_IO_CONFIG="$CONFIG_FILE"
+export MESSAGE_IO_CONFIG="$CONFIG_FILE"
 export XDG_CACHE_HOME="$CACHE_DIR"
 export PIP_CACHE_DIR="$CACHE_DIR/pip"
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 
-if [ "${FEISHU_IO_FORCE_INSTALL:-0}" = "1" ] \
-  || [ ! -x "$VENV_DIR/bin/feishu-ioctl" ] \
+if [ "${MESSAGE_IO_FORCE_INSTALL:-0}" = "1" ] \
+  || [ ! -x "$VENV_DIR/bin/message-ioctl" ] \
   || ! "$VENV_DIR/bin/python" -c "import httpx" >/dev/null 2>&1; then
   "$PYTHON" -m venv "$VENV_DIR"
   "$VENV_DIR/bin/python" -m pip install -e "$PROJECT_ROOT"
 fi
 
-exec "$VENV_DIR/bin/feishu-ioctl" "$@"
+exec "$VENV_DIR/bin/message-ioctl" "$@"

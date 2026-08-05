@@ -12,16 +12,16 @@ def _load_entrypoint(module_name: str, function_name: str) -> Callable[[], None]
     except ModuleNotFoundError as exc:
         if exc.name and exc.name.split(".", 1)[0] in SERVER_MODULES:
             raise SystemExit(
-                "FeiShuIO server dependencies are not installed. "
-                "Install them with: pip install 'feishu-io[server]'"
+                "MessageIO server dependencies are not installed. "
+                "Install them with: pip install 'message-io[server]'"
             ) from exc
         raise
     return getattr(module, function_name)
 
 
 def main() -> None:
-    _load_entrypoint("feishu_io.server", "main")()
+    _load_entrypoint("message_io.server", "main")()
 
 
 def listener_main() -> None:
-    _load_entrypoint("feishu_io.listener", "main")()
+    _load_entrypoint("message_io.listener", "main")()

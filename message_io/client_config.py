@@ -29,14 +29,14 @@ def client_config_path(path: str | os.PathLike[str] | None = None) -> Path:
     if path is not None:
         return Path(path).expanduser()
 
-    configured = os.getenv("FEISHU_IO_CONFIG")
+    configured = os.getenv("MESSAGE_IO_CONFIG")
     if configured:
         return Path(configured).expanduser()
 
     config_home = os.getenv("XDG_CONFIG_HOME")
     if config_home:
-        return Path(config_home).expanduser() / "feishu-io" / "client.json"
-    return Path.home() / ".config" / "feishu-io" / "client.json"
+        return Path(config_home).expanduser() / "message-io" / "client.json"
+    return Path.home() / ".config" / "message-io" / "client.json"
 
 
 def load_client_config(

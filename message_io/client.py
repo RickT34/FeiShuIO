@@ -6,21 +6,17 @@ from typing import Any
 
 import httpx
 
-from feishu_io.client_config import (
-    ClientConfig,
-    load_client_config,
-    normalize_server_url,
-)
+from message_io.client_config import ClientConfig, load_client_config, normalize_server_url
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 
 
-class FeishuIOError(RuntimeError):
+class MessageIOError(RuntimeError):
     pass
 
 
-class FeishuIO:
+class MessageIO:
     def __init__(
         self,
         base_url: str | None = None,
@@ -30,11 +26,9 @@ class FeishuIO:
         transport: httpx.BaseTransport | None = None,
         config_path: str | os.PathLike[str] | None = None,
     ) -> None:
-        environment_url = os.getenv("FEISHU_IO_URL")
-        environment_key = os.getenv("FEISHU_IO_API_KEY")
-        selected_url = (
-            base_url if base_url is not None else (environment_url or None)
-        )
+        environment_url = os.getenv("MESSAGE_IO_URL")
+        environment_key = os.getenv("MESSAGE_IO_API_KEY")
+        selected_url = base_url if base_url is not None else (environment_url or None)
         stored = ClientConfig()
         if selected_url is None or not (api_key or environment_key):
             stored = load_client_config(config_path)
@@ -43,7 +37,7 @@ class FeishuIO:
         )
         self.api_key = api_key or environment_key or stored.api_key
         if not self.api_key:
-            raise ValueError("api_key is required, or set FEISHU_IO_API_KEY")
+            raise ValueError("api_key is required, or set MESSAGE_IO_API_KEY")
         self.timeout = timeout
         self.transport = transport
 
@@ -59,7 +53,9 @@ class FeishuIO:
             ) as client:
                 response = client.request(method, path, headers=self._headers(), **kwargs)
         except httpx.HTTPError as exc:
-            raise FeishuIOError(f"request to {self.base_url}{path} failed: {exc}") from exc
+            raise MessageIOError(
+                f"request to {self.base_url}{path} failed: {exc}"
+            ) from exc
         if response.status_code >= 400:
             detail: Any = response.text.strip()
             try:
@@ -70,56 +66,66 @@ class FeishuIO:
                 pass
             if not isinstance(detail, str):
                 detail = json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
-            raise FeishuIOError(f"{response.status_code}: {detail}")
+            raise MessageIOError(f"{response.status_code}: {detail}")
         try:
             return response.json()
         except ValueError as exc:
-            raise FeishuIOError(
+            raise MessageIOError(
                 f"{response.status_code} response from {path} is not valid JSON"
             ) from exc
 
-    def send_markdown(self, text: str, id: str) -> dict[str, Any]:
-        return self._request("POST", "/send_markdown", json={"id": id, "text": text})
-
-    def recv_unread(
+    def send(
         self,
-        id: str,
+        target: str,
+        text: str,
+        *,
+        content_type: str = "markdown",
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/messages/send",
+            json={
+                "target": target,
+                "content": {"type": content_type, "text": text},
+            },
+        )
+
+    def receive(
+        self,
+        target: str,
         *,
         limit: int = 100,
         ack: bool = True,
     ) -> list[dict[str, Any]]:
-        data = self._request(
-            "POST",
-            "/recv_unread",
-            json={"id": id, "limit": limit, "ack": ack},
+        return list(
+            self.receive_response(target, limit=limit, ack=ack).get("messages") or []
         )
-        return list(data.get("messages") or [])
 
-    def recv_unread_response(
+    def receive_response(
         self,
-        id: str,
+        target: str,
         *,
         limit: int = 100,
         ack: bool = True,
     ) -> dict[str, Any]:
         return self._request(
             "POST",
-            "/recv_unread",
-            json={"id": id, "limit": limit, "ack": ack},
+            "/messages/receive",
+            json={"target": target, "limit": limit, "ack": ack},
         )
 
-    def ack_messages(
+    def acknowledge(
         self,
-        id: str,
+        target: str,
         message_ids: list[int],
         *,
         lease_token: str,
     ) -> dict[str, Any]:
         return self._request(
             "POST",
-            "/ack_messages",
+            "/messages/acknowledge",
             json={
-                "id": id,
+                "target": target,
                 "message_ids": message_ids,
                 "lease_token": lease_token,
             },

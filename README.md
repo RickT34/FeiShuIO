@@ -1,143 +1,72 @@
-# FeiShuIO
+# MessageIO
 
-一个面向自主运行 Agent 的极简飞书消息桥。它让运行在服务器、工作站或容器中的 Agent 能够通过命令行向飞书汇报状态，并在真正需要人工决策时可靠地接收指示。
+MessageIO 是面向自主 Agent 和长任务的多平台消息桥。Server 负责连接飞书等消息平台、保存可靠队列并提供统一 REST API；Client 只理解平台无关的 target、sender 和 content，无需安装平台 SDK，也不会收到平台原始事件。
 
-我目前主要用它观察长时间自主运行的 Agent：Agent 在关键阶段主动发送进度，遇到阻塞时报告上下文并等待指示，完成或失败后发送最终结果。这样不需要一直守着终端，也不需要给每台 Agent 机器安装飞书 SDK 或暴露公网端口。
+当前内置飞书 adapter。新增 Slack、Discord、Telegram 等平台时，现有 Client、CLI、REST DTO 和队列协议无需修改。
 
-## 典型使用场景
+## 通用数据契约
 
-### 自主运行 Agent 状态汇报
+发送请求：
 
-这是 FeiShuIO 的主要使用场景：
-
-- **过程可见**：训练、评测、部署或代码修改进入关键阶段时，Agent 主动发送简洁状态。
-- **阻塞求助**：缺少凭证、需要业务选择或继续执行存在风险时，Agent 把已完成工作、阻塞原因和建议发送到飞书。
-- **远程指示**：用户直接在飞书群回复，Agent 使用可靠的租约模式读取，理解并确认指示后继续执行。
-- **结果通知**：任务完成或失败时，自动发送结果、验证情况和产物位置。
-
-例如，Agent 可以直接执行：
-
-```bash
-# 汇报当前进度
-./scripts/client.sh send gpu-a '**状态更新**：训练已完成 3/5 个阶段，指标正常。'
-
-# 遇到真正的阻塞时等待指示；消息不会在处理成功前丢失
-./scripts/client.sh recv gpu-a --wait 60 --no-ack
-./scripts/client.sh ack gpu-a LEASE_TOKEN 1 2 3
-
-# 汇报最终结果
-cat run-summary.md | ./scripts/client.sh send gpu-a -
+```json
+{"target":"gpu-a","content":{"type":"markdown","text":"**训练完成**"}}
 ```
 
-仓库提供了可复用的 [`prompts/AGENTS.md`](prompts/AGENTS.md)，用于约束 Codex 等 Agent 在自主执行期间何时汇报、何时等待以及如何可靠确认消息。跨服务器接入方法见 [`prompts/README.md`](prompts/README.md)。
+发送成功时会返回同名 alias 实际触达的目的地数量：
 
-### 其他长任务与自动化
+```json
+{"ok":true,"target":"gpu-a","sent":2}
+```
 
-FeiShuIO 也适用于无人值守脚本、定时任务、数据处理流水线和服务巡检。调用端只需运行一个命令，就能发送 Markdown 报告或读取飞书中的控制消息；默认输出为精简的单行 JSON，便于 Shell 脚本和 Agent 解析。
+接收响应：
 
-## 工作方式
+```json
+{
+  "ok": true,
+  "target": "gpu-a",
+  "messages": [{
+    "message_id": 42,
+    "sender": {"id": "user-1", "name": "Rick"},
+    "content": {"type": "text", "text": "继续运行"},
+    "received_at": "2026-08-05 10:00:00"
+  }],
+  "ack_required": true,
+  "lease_token": "..."
+}
+```
 
-FeiShuIO 采用 server/client 分离：
+Client 看不到 `chat_id`、飞书响应 code、原始 webhook payload 或平台专用字段。`sender.id` 是平台提供的不透明标识，但字段语义和结构在所有平台一致。
 
-- **Server** 在一台服务器上常驻，维护飞书长连接、SQLite 消息队列和 REST API。
-- **Client** 放在各个 Agent 或任务机器上，只在发送或接收消息时启动，命令结束后退出。
-- **飞书群** 既是状态面板，也是需要人工介入时的控制入口。
+规范化内容类型为 `text`、`markdown`、`image`、`file`、`audio`、`video` 和 `unknown`。当前飞书 adapter 支持发送 `text` 与 `markdown`；无法发送的通用类型会在 adapter 边界明确报错。
 
-Server 使用飞书开放平台的长连接事件接收模式，不需要公网 IP，只需要能主动访问飞书开放平台。Agent 机器也不需要飞书应用凭证，只需知道 Server URL、API key 和群 alias。
-
-核心消息接口是：
-
-- `send_markdown(text, id)`：向 `id` 绑定的飞书群发送 Markdown。
-- `recv_unread(id)`：取出 `id` 绑定群的未读消息，返回后即标记为已读。
-
-群绑定不再手动填写 `chat_id`。把应用机器人拉进群后，在群里发送：
+## 架构
 
 ```text
-/bind test
+Client / CLI
+    -> platform-neutral REST models
+    -> target routing + reliable SQLite queue
+    -> PlatformRegistry
+       -> FeishuAdapter + Feishu listener
+       -> future adapters/listeners
 ```
 
-服务会自动记录：
+- `message_io/domain.py`：平台无关的 destination、sender、content 和内部投递引用。
+- `message_io/platforms/base.py`：`PlatformAdapter` 与 `PlatformListener` 协议。
+- `message_io/platforms/registry.py`：按 `(platform, account_id)` 注册和选择 adapter。
+- `message_io/platforms/feishu.py`：飞书 API、payload 转换和入站事件规范化。
+- `message_io/store.py`：通用目的地、去重、租约、确认和清理。
+- `message_io/server.py`：只编排通用协议、store 和 registry。
 
-```text
-test -> 当前群 chat_id
-```
+数据库中的目的地由 `(platform, account_id, conversation_id)` 唯一标识，alias 只是对 Client 暴露的 target。同一 alias 可以绑定多个平台、账号和会话；接收时合并所有同名目的地的消息，按全局消息 ID 排序，并对合并结果应用一次 `limit`；发送时向所有同名目的地广播。广播是尽力而为且非原子的：服务会尝试全部目的地，任一失败时返回不含平台细节的成功数与失败数。消息在绑定前也可入队；稍后执行 `/bind alias` 后即可读取。外部消息 ID 按平台和账号隔离，不会因不同平台使用相同 ID 而错误去重。
 
-之后其他项目只需要使用 `test`。
+## 新增平台
 
-## 飞书应用配置
+1. 实现 `PlatformAdapter.send()` 和 `mark_delivered()`。
+2. 将平台事件转换为 `domain.IncomingMessage`，原始 payload 只写入私有存储字段。
+3. 如需监听，实现 `PlatformListener` 的 `start()`、`stop()` 和 `status()`。
+4. 在 `get_platforms()` 中注册 adapter/listener，并加入该平台自己的 callback route 和配置。
 
-在飞书开放平台创建企业自建应用，并开启机器人能力。
-
-需要配置：
-
-- `APP_ID`
-- `APP_SECRET`
-- 事件订阅方式选择长连接
-- 事件订阅 Verification Token
-- 接收消息事件，例如 `im.message.receive_v1`
-- 发送消息所需权限，例如向群聊发送消息的权限
-- 添加消息 reaction 所需权限，用于 `recv_unread` 后给原消息标记已处理
-
-把机器人添加到目标群后，在群里发 `/bind alias` 完成绑定。
-同一个群再次绑定新的 `alias` 时，会替换旧 alias，避免一个群同时占用多个业务 id。
-
-`alias` 只能包含字母、数字、下划线、横线和点，最长 64 个字符，例如：
-
-```text
-/bind research
-/bind paper-alert
-/bind exp.v1
-```
-
-## 部署结构
-
-- Server：只部署一份，持久连接飞书并保存 SQLite 消息队列。
-- Client：可安装在任意 agent 或任务机器上，只依赖 HTTP 客户端，不需要飞书 SDK、数据库或服务端配置。
-- 调用端只需要知道 Server URL、API key 和群 alias。
-
-API key 会随 HTTP 请求发送。跨机器部署时应使用 HTTPS 反向代理或可信内网，不要把明文 HTTP 直接暴露到公网。
-
-## Server 常驻部署
-
-Server 使用独立 Python 虚拟环境，不需要 Docker，也不需要手动激活环境。先准备配置：
-
-```bash
-cp .env.example .env
-# 编辑 .env，填入 API key 和飞书应用凭证
-```
-
-Linux 服务器使用 systemd 用户服务常驻运行，只需执行：
-
-```bash
-./scripts/install-server-service.sh
-```
-
-安装脚本会自动创建 `.server-venv`、安装 Server 依赖、写入当前用户的 systemd service，并立即启动；安装服务本身不需要 root。为了保证服务器重启或用户退出登录后仍然运行，需要为该用户启用 linger：
-
-```bash
-sudo loginctl enable-linger "$USER"
-```
-
-日常管理：
-
-```bash
-systemctl --user status feishu-io.service
-systemctl --user restart feishu-io.service
-journalctl --user -u feishu-io.service -f
-curl http://127.0.0.1:8000/ready
-```
-
-没有 systemd 或只想前台运行时，使用同一个轻量启动器：
-
-```bash
-./scripts/run-server.sh
-```
-
-它会在首次运行时自动创建环境，后续直接启动。卸载常驻服务但保留配置和数据：
-
-```bash
-./scripts/uninstall-server-service.sh
-```
+不得在通用 models、Client 或 CLI 中增加 provider 字段。平台能力差异应在 adapter 中映射到规范化内容类型，无法无损支持时返回明确错误。
 
 ## Server 配置
 
@@ -145,255 +74,97 @@ curl http://127.0.0.1:8000/ready
 cp .env.example .env
 ```
 
-编辑 `.env`：
+最小配置：
 
 ```env
-FEISHU_IO_API_KEY=change-this-api-key
-FEISHU_IO_DB=./data/feishu_io.sqlite3
-FEISHU_IO_ENABLE_WS=true
-FEISHU_IO_HOST=0.0.0.0
-FEISHU_IO_PORT=8000
-FEISHU_IO_LOG_LEVEL=info
+MESSAGE_IO_API_KEY=change-this-api-key
+MESSAGE_IO_DB=./data/message_io.sqlite3
+MESSAGE_IO_HOST=0.0.0.0
+MESSAGE_IO_PORT=8000
+FEISHU_ACCOUNT_ID=default
+FEISHU_ENABLED=true
 FEISHU_APP_ID=cli_xxxx
 FEISHU_APP_SECRET=xxxx
+FEISHU_LISTENER_ENABLED=true
 FEISHU_EVENT_VERIFY_TOKEN=xxxx
-FEISHU_EVENT_ENCRYPT_KEY=
-FEISHU_MARK_READ_REACTION=true
-FEISHU_READ_REACTION_EMOJI=Get
-FEISHU_RETRY_ATTEMPTS=3
-FEISHU_RETRY_BASE_DELAY=0.5
-FEISHU_LISTENER_RETRY_BASE_DELAY=1
-FEISHU_LISTENER_RETRY_MAX_DELAY=60
-FEISHU_MESSAGE_LEASE_SECONDS=300
-FEISHU_DELIVERED_RETENTION_DAYS=30
-FEISHU_PROCESSED_RETENTION_DAYS=30
 ```
 
-`FEISHU_IO_API_KEY` 是本服务业务接口的访问 key，用来防止信息泄露。
+完整选项见 [`.env.example`](.env.example)。飞书长连接不需要公网 IP；HTTP callback 使用 `/platforms/feishu/events`，只有配置 Verification Token 后才启用。
 
-`FEISHU_IO_ENABLE_WS=true` 表示启动 REST 服务时自动启动飞书长连接监听。大多数单机部署保持默认即可。
-
-`FEISHU_MARK_READ_REACTION=true` 表示 `recv_unread` 成功取走缓存消息后，会给飞书原消息添加一个 reaction，默认 emoji 类型是 `Get`。如果飞书侧权限或 emoji 类型不支持，接口仍会返回消息，只在服务日志里记录失败原因。
-
-`FEISHU_RETRY_ATTEMPTS` 和 `FEISHU_RETRY_BASE_DELAY` 控制飞书 HTTP API 的有限重试，用于处理临时网络错误、429 和 5xx。发送消息会携带飞书 `uuid` 幂等键后再重试；没有幂等保证的写操作不会自动重放。
-
-`FEISHU_LISTENER_RETRY_BASE_DELAY` 和 `FEISHU_LISTENER_RETRY_MAX_DELAY` 控制长连接监听异常退出后的自动重连退避。
-
-`FEISHU_MESSAGE_LEASE_SECONDS` 控制可靠读取模式下消息租约时长。租约过期且未确认的消息会重新出现在 `recv_unread` 结果里。
-
-`FEISHU_DELIVERED_RETENTION_DAYS` 和 `FEISHU_PROCESSED_RETENTION_DAYS` 控制启动和手动清理时保留已投递消息、去重记录的天数。
-
-`FEISHU_IO_HOST`、`FEISHU_IO_PORT` 和 `FEISHU_IO_LOG_LEVEL` 控制服务端监听地址、端口和日志级别。
-
-如果想把 REST 服务和飞书长连接监听拆成两个进程，可以这样：
+启动前台服务：
 
 ```bash
-FEISHU_IO_ENABLE_WS=false uvicorn feishu_io.server:app --host 0.0.0.0 --port 8000
-feishu-io-listener
+./scripts/run-server.sh
 ```
 
-单机部署建议只跑一个长连接监听进程。REST 服务内置的监听器会防止同一进程内重复启动，并在服务关闭时关闭底层长连接和监听线程。多实例同时连接时，飞书会把同一个事件随机投递给其中一个连接。
-
-## API 认证
-
-`/send_markdown` 和 `/recv_unread` 都需要 API key。两种写法任选一种：
+安装 systemd 用户服务：
 
 ```bash
-X-API-Key: change-this-api-key
+./scripts/install-server-service.sh
+systemctl --user status message-io.service
 ```
 
-或：
+跨机器访问时应使用 HTTPS 反向代理或可信内网，不要把带 API key 的明文 HTTP 暴露到公网。
 
-```bash
-Authorization: Bearer change-this-api-key
-```
+## Client
 
-## Client 单命令调用
-
-Client 不需要安装到系统或用户目录。虚拟环境、配置都保存在当前仓库内，所有操作统一使用：
-
-```bash
-./scripts/client.sh <command>
-```
-
-脚本首次运行时自动创建 `.client-venv` 并安装轻量 Client 依赖，后续直接执行命令。Client 配置固定保存在 `.client/client.json`，缓存固定保存在 `.client/cache`；这些目录均已加入 `.gitignore`，不会写入仓库外目录，也不会误提交密钥。脚本拒绝 `--config` 覆盖，避免 agent 意外把配置写到其他位置。
-
-首次配置一次 URL 和 key。用 stdin 可以避免 key 出现在 shell history 中：
+所有自动化统一使用自举脚本：
 
 ```bash
 printf '%s' 'change-this-api-key' | \
-  ./scripts/client.sh configure https://feishu-io.example.com --key-stdin
-./scripts/client.sh ready
+  ./scripts/client.sh configure https://message-io.example.com --key-stdin
+./scripts/client.sh send gpu-a '**状态**：阶段 3/5 已完成'
+./scripts/client.sh send gpu-a 'plain text' --type text
+./scripts/client.sh recv gpu-a --wait 60 --no-ack
+./scripts/client.sh ack gpu-a LEASE_TOKEN 1 2 3
 ```
 
-配置文件权限为 `0600`，配置目录权限为 `0700`。可以运行 `./scripts/client.sh config` 查看当前使用的 Server URL；该命令不会输出 API key。
+`recv` 默认立即确认。无人值守 Agent 应使用 `--no-ack` 获取租约，在成功理解和处理消息后再 `ack`；租约过期的消息会重新投递。CLI 默认输出紧凑单行 JSON，`--full` 输出完整的通用响应，仍不会包含平台私有数据。
 
-发送消息只需要一条命令：
+Python Client：
+
+```python
+from message_io import MessageIO
+
+client = MessageIO("https://message-io.example.com", "api-key")
+client.send("gpu-a", "**完成**")
+messages = client.receive("gpu-a", ack=True)
+```
+
+## 飞书绑定
+
+把机器人加入群聊后发送 `/bind gpu-a`。同一会话绑定新 alias 会替换该会话的旧 alias，但不会影响其他会话；不同平台、账号和会话可以共享同一个 alias。对该 alias 的接收会汇总所有绑定会话，对该 alias 的发送会广播到所有绑定会话。alias 允许字母、数字、下划线、横线和点，最长 64 个字符。
+
+## 从 v3 迁移
+
+新服务不会自动读取或修改 v3 数据库。停止旧服务后执行：
 
 ```bash
-./scripts/client.sh send test '**训练完成**'
-cat report.md | ./scripts/client.sh send test -
+python3 scripts/migrate_v3_to_v5.py data/message_io_v3.sqlite3 \
+  --output data/message_io.sqlite3 \
+  --env-file .env \
+  --env-output .env.v5
 ```
 
-立即读取当前未读消息：
+脚本不会覆盖源文件。它保留绑定、消息 ID、已投递状态、有效租约和去重记录，并把旧数据归入 `feishu/default`。检查 `.env.v5` 后，用它替换部署配置再启动 MessageIO。输出数据库或配置已存在时脚本会拒绝运行。运行时不包含旧 schema 兼容逻辑。
+
+## REST API
+
+- `POST /messages/send`
+- `POST /messages/receive`
+- `POST /messages/acknowledge`
+- `GET /health`
+- `GET /ready`
+- `POST /maintenance/cleanup`
+- `POST /platforms/feishu/events`
+
+业务接口接受 `X-API-Key` 或 `Authorization: Bearer ...`。健康检查不包含消息内容；readiness 只报告数据库和消息后端聚合状态，不向 Client 暴露具体平台。
+
+## 验证
 
 ```bash
-./scripts/client.sh recv test
+.venv/bin/python -m pytest -q
+.venv/bin/python -m compileall -q message_io scripts/migrate_v3_to_v5.py
 ```
 
-等待最多 60 秒，适合 agent 等待下一条指令：
-
-```bash
-./scripts/client.sh recv test --wait 60
-```
-
-需要“处理成功后才删除”的无人值守任务，应使用租约模式：
-
-```bash
-./scripts/client.sh recv test --wait 60 --no-ack
-./scripts/client.sh ack test LEASE_TOKEN 1 2 3
-```
-
-所有命令默认输出供 Agent 使用的单行精简 JSON，失败时返回非零退出码并把简洁错误写到 stderr。`recv` 只保留消息编号、发送者、正文、时间；租约令牌提升到响应顶层，避免每条消息重复输出。需要排障或读取服务端完整响应时，在子命令前加 `--full`，例如 `./scripts/client.sh --full ready`。为保证环境与数据边界一致，自动化调用统一使用 `scripts/client.sh`，不要直接调用内部的 `feishu-ioctl`。
-
-`LEASE_TOKEN` 是 `recv --no-ack` 返回的顶层 `lease_token`。它只对当前租约有效，租约过期或消息被重新租出后不能再确认。
-
-健康检查：
-
-```bash
-./scripts/client.sh ready
-```
-
-## 发送 Markdown
-
-```bash
-curl -X POST http://127.0.0.1:8000/send_markdown \
-  -H "X-API-Key: change-this-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"id":"test","text":"**训练完成**\n\n结果已写入 `runs/latest`。"}'
-```
-
-返回：
-
-```json
-{
-  "ok": true,
-  "id": "test",
-  "feishu_code": 0,
-  "message": "success"
-}
-```
-
-如果 `id` 还没绑定，会返回 `404`，并提示你在群里发送 `/bind id`。
-
-## 读取未读消息
-
-```bash
-curl -X POST http://127.0.0.1:8000/recv_unread \
-  -H "X-API-Key: change-this-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"id":"test","limit":100}'
-```
-
-返回：
-
-```json
-{
-  "ok": true,
-  "id": "test",
-  "messages": [
-    {
-      "message_id": 1,
-      "external_message_id": "om_xxx",
-      "id": "test",
-      "sender_id": "ou_xxx",
-      "sender_name": "user",
-      "message_type": "text",
-      "text": "hello",
-      "raw": {},
-      "created_at": "2026-06-25 10:00:00",
-      "lease_token": null
-    }
-  ]
-}
-```
-
-`recv_unread` 会把返回的消息标记为本地已读；同一批消息不会在下一次调用里重复返回。默认还会给飞书原消息添加 `Get` reaction，方便群里用户知道这条消息已经被下游应用取走。
-
-如果下游程序需要更可靠的无人值守读取，可以传 `ack=false`：
-
-```bash
-curl -X POST http://127.0.0.1:8000/recv_unread \
-  -H "X-API-Key: change-this-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"id":"test","limit":100,"ack":false}'
-```
-
-这时消息只会被临时租出，不会立刻标记为已读。每条返回消息都包含本批次的 `lease_token`。下游处理成功后使用同一个令牌调用：
-
-```bash
-curl -X POST http://127.0.0.1:8000/ack_messages \
-  -H "X-API-Key: change-this-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"id":"test","message_ids":[1,2,3],"lease_token":"0123456789abcdef0123456789abcdef"}'
-```
-
-如果下游崩溃，没有及时确认，租约过期后这些消息会再次返回，并生成新的租约令牌。领取和确认都在 SQLite 单条原子更新中完成，因此多个消费者不会领取或确认彼此的租约。
-
-## 健康检查和维护
-
-`GET /health` 是浅健康检查，只表示 HTTP 进程仍能响应。
-
-`GET /ready` 会检查 SQLite，并在启用内置长连接监听时检查飞书 WebSocket 是否真实连接；仅有重试线程存活不会被视为就绪。无人值守部署建议把 `/ready` 接到外部监控。
-
-可以手动清理历史数据：
-
-```bash
-curl -X POST http://127.0.0.1:8000/maintenance/cleanup \
-  -H "X-API-Key: change-this-api-key"
-```
-
-服务启动时也会按保留天数自动清理一次已投递消息和去重记录。
-
-## 消息监听
-
-飞书会通过长连接把消息事件推给本服务。本服务会处理两类消息：
-
-- `/bind alias`：绑定当前群。
-- 其他文本消息：按稳定的飞书 `chat_id` 写入未读队列，读取时再解析 alias。
-
-如果某个群还没有绑定，消息会按原始 `chat_id` 暂存；之后完成绑定或更换 alias，不会丢失已经排队的消息。
-
-项目仍保留 `POST /feishu/events` 作为兼容入口；如果以后你有公网域名，也可以切回传统 HTTP 回调。该入口只在配置了 `FEISHU_EVENT_VERIFY_TOKEN` 时启用，并由飞书 SDK 统一完成 token、签名和加密载荷校验。没有公网 IP 时，只需要长连接模式。
-
-## Codex goal 自动通知
-
-Agent 可以在执行过程中直接调用 `send` 汇报状态。对于使用 Codex goal 的任务，还可以在 goal 进入 `complete` 或 `blocked` 状态时，通过仓库中的 `scripts/codex_goal_hook.sh` 自动发送一条终态通知。
-
-先确保启动 Codex 的环境已经设置 `FEISHU_AGENT_ID` 和 `FEISHU_IO_CLIENT`，具体配置见 [`prompts/README.md`](prompts/README.md)。然后添加以下 Hook：
-
-```text
-~/.codex/hooks.json
-```
-
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "^update_goal$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/PATH/TO/FeiShuIO/scripts/codex_goal_hook.sh",
-            "timeout": 60,
-            "statusMessage": "Sending goal notification"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-将 `/PATH/TO/FeiShuIO` 替换为本机仓库的绝对路径。这个 Hook 只负责 goal 完成或阻塞时的简短自动通知；阶段性进度、详细结果和等待用户指示的流程仍应由 Agent 按 [`prompts/AGENTS.md`](prompts/AGENTS.md) 调用 Client 完成。
+可复用的自主 Agent 指令模板位于 [`prompts/AGENTS.md`](prompts/AGENTS.md)。

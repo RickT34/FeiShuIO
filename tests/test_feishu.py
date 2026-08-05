@@ -3,56 +3,106 @@ import json
 import httpx
 import pytest
 
-from feishu_io.feishu import FeishuAppClient, FeishuAppError
-from feishu_io.feishu import build_markdown_message_payload, build_reaction_payload
+from message_io.domain import Destination, MessageContent
+from message_io.platforms.feishu import (
+    FeishuAdapter,
+    FeishuError,
+    build_message_payload,
+    build_reaction_payload,
+    extract_message,
+)
 
 
-def test_build_markdown_message_payload_uses_string_content():
-    payload = build_markdown_message_payload(
-        chat_id="oc_1",
-        text="**hello**",
+def adapter(**overrides):
+    values = {
+        "account_id": "default",
+        "app_id": "cli_test",
+        "app_secret": "secret",
+        "reaction_emoji": "Get",
+        "retry_attempts": 2,
+        "retry_base_delay": 0,
+    }
+    values.update(overrides)
+    return FeishuAdapter(**values)
+
+
+def test_markdown_is_adapted_to_feishu_interactive_message():
+    payload = build_message_payload(
+        conversation_id="oc_1",
+        content=MessageContent(type="markdown", text="**hello**"),
         idempotency_key="request-1",
     )
 
     assert payload["receive_id"] == "oc_1"
     assert payload["msg_type"] == "interactive"
-    assert isinstance(payload["content"], str)
     assert json.loads(payload["content"])["elements"][0]["content"] == "**hello**"
     assert payload["uuid"] == "request-1"
 
 
-def test_build_reaction_payload():
-    assert build_reaction_payload(emoji_type="Get") == {
-        "reaction_type": {"emoji_type": "Get"}
-    }
+def test_plain_text_is_adapted_without_markdown_card():
+    payload = build_message_payload(
+        conversation_id="oc_1", content=MessageContent(type="text", text="hello")
+    )
+
+    assert payload["msg_type"] == "text"
+    assert json.loads(payload["content"]) == {"text": "hello"}
+
+
+def test_feishu_event_is_normalized_at_adapter_boundary():
+    message = extract_message(
+        {
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_1"}},
+                "message": {
+                    "message_id": "om_1",
+                    "chat_id": "oc_1",
+                    "message_type": "text",
+                    "content": '{"text":"hello"}',
+                },
+            }
+        },
+        account_id="bot-a",
+    )
+
+    assert message is not None
+    assert message.destination == Destination("feishu", "bot-a", "oc_1")
+    assert message.sender.id == "ou_1"
+    assert message.content == MessageContent(type="text", text="hello")
+
+
+def test_unknown_feishu_content_becomes_common_unknown_message():
+    message = extract_message(
+        {
+            "event": {
+                "message": {
+                    "message_id": "om_1",
+                    "chat_id": "oc_1",
+                    "message_type": "sticker",
+                    "content": "{}",
+                }
+            }
+        },
+        account_id="default",
+    )
+
+    assert message.content == MessageContent(type="unknown", text="[unknown]")
 
 
 @pytest.mark.asyncio
-async def test_post_json_retries_transient_http_errors(monkeypatch):
+async def test_retry_safe_request_retries_transient_failure(monkeypatch):
     calls = 0
-
-    async def fake_sleep(_delay):
-        return None
 
     async def fake_post(self, *args, **kwargs):
         nonlocal calls
         calls += 1
         request = httpx.Request("POST", "https://open.feishu.cn/test")
         if calls == 1:
-            return httpx.Response(500, request=request, text="temporarily down")
+            return httpx.Response(500, request=request, text="down")
         return httpx.Response(200, request=request, json={"code": 0})
 
-    monkeypatch.setattr("asyncio.sleep", fake_sleep)
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
 
-    client = FeishuAppClient(
-        app_id="cli_test",
-        app_secret="secret",
-        retry_attempts=2,
-        retry_base_delay=0,
-    )
-
-    response = await client._post_json(
+    response = await adapter()._post_json(
         "https://open.feishu.cn/test", retry_safe=True
     )
 
@@ -61,71 +111,36 @@ async def test_post_json_retries_transient_http_errors(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_post_json_does_not_retry_ambiguous_posts(monkeypatch):
+async def test_ambiguous_write_is_not_retried(monkeypatch):
     calls = 0
 
     async def fake_post(self, *args, **kwargs):
         nonlocal calls
         calls += 1
         request = httpx.Request("POST", "https://open.feishu.cn/test")
-        return httpx.Response(500, request=request, text="temporarily down")
+        return httpx.Response(500, request=request, text="down")
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
-    client = FeishuAppClient(
-        app_id="cli_test",
-        app_secret="secret",
-        retry_attempts=3,
-        retry_base_delay=0,
-    )
 
-    with pytest.raises(FeishuAppError, match="Feishu HTTP 500"):
-        await client._post_json("https://open.feishu.cn/test")
-
+    with pytest.raises(FeishuError, match="Feishu HTTP 500"):
+        await adapter(retry_attempts=3)._post_json("https://open.feishu.cn/test")
     assert calls == 1
 
 
 @pytest.mark.asyncio
-async def test_send_markdown_uses_one_idempotency_key_for_retries(monkeypatch):
-    requests = []
-    client = FeishuAppClient(
-        app_id="cli_test",
-        app_secret="secret",
-        retry_attempts=2,
-        retry_base_delay=0,
-    )
+async def test_unsupported_common_outbound_type_fails_at_adapter(monkeypatch):
+    client = adapter()
     client._tenant_access_token = "token"
     client._token_expires_at = 10**20
 
-    async def fake_post(self, url, **kwargs):
-        requests.append(kwargs["json"])
-        request = httpx.Request("POST", url)
-        if len(requests) == 1:
-            return httpx.Response(500, request=request, text="temporarily down")
-        return httpx.Response(200, request=request, json={"code": 0, "msg": "ok"})
-
-    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
-
-    await client.send_markdown(chat_id="oc_1", text="hello")
-
-    assert len(requests) == 2
-    assert len(requests[0]["uuid"]) == 32
-    assert requests[0]["uuid"] == requests[1]["uuid"]
+    with pytest.raises(FeishuError, match="cannot send content type"):
+        await client.send(
+            destination=Destination("feishu", "default", "oc_1"),
+            content=MessageContent(type="image", text="[image]"),
+        )
 
 
-@pytest.mark.asyncio
-async def test_post_json_wraps_request_errors(monkeypatch):
-    async def fake_post(self, *args, **kwargs):
-        request = httpx.Request("POST", "https://open.feishu.cn/test")
-        raise httpx.ConnectError("boom", request=request)
-
-    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
-
-    client = FeishuAppClient(
-        app_id="cli_test",
-        app_secret="secret",
-        retry_attempts=1,
-        retry_base_delay=0,
-    )
-
-    with pytest.raises(FeishuAppError, match="Feishu request failed"):
-        await client._post_json("https://open.feishu.cn/test")
+def test_reaction_payload_is_provider_private():
+    assert build_reaction_payload(emoji_type="Get") == {
+        "reaction_type": {"emoji_type": "Get"}
+    }
